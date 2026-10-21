@@ -1,0 +1,49 @@
+# Function Calling Fine-tuning
+
+## Setup
+
+Use Python 3.10 or newer. Run all commands from the repository root: the folder containing `pyproject.toml`, `data/`, `model/`, and your test folder.
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed, then install the project dependencies:
+
+```bash
+python -m pip install uv
+uv sync
+```
+
+`uv sync` creates a local `.venv` and installs the dependencies from `pyproject.toml`, including pytest. Commands run with `uv run` use this environment automatically.
+
+## Hugging Face login
+
+The dataset requires accepting its access conditions before downloading it.
+
+1. Sign in to [Hugging Face](https://huggingface.co/).
+2. Open the [dataset page](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k) and accept the access conditions.
+3. Create a **Read** token in [Settings → Access Tokens](https://huggingface.co/settings/tokens) using the same account.
+4. [Log in](https://huggingface.co/docs/huggingface_hub/v0.36.0/guides/cli#hf-auth-login) from the terminal:
+
+```bash
+uv run hf auth login
+```
+
+Paste your token when prompted. If asked to add it as a Git credential, choose **n**; the saved Hugging Face login is enough for these downloads.
+
+## Run tests
+
+Run all tests:
+
+```bash
+uv run pytest -v
+```
+
+Run only the data tests:
+
+```bash
+uv run pytest -v -k data_test
+```
+
+Run only the model tests:
+
+```bash
+uv run pytest -v -k model_test
+```
