@@ -47,3 +47,26 @@ Run only the model tests:
 ```bash
 uv run pytest -v -k model_test
 ```
+Run only the eval tests (no model or dataset download):
+
+```bash
+uv run pytest -v -k eval_test
+```
+
+## Run baseline evaluation
+
+Evaluate the base model (no fine-tuned adapter) on the held-out `test_seen` split. This requires the [Hugging Face login](#hugging-face-login) above. The first run downloads the dataset and the ~1.3B model (~3 GB). A GPU is used automatically if available; on Apple Silicon add `--device mps`, since CPU-only runs are slow.
+
+```bash
+uv run python -m eval.baseline --limit 100
+```
+
+`--limit` sets how many examples to evaluate (default 100). Use `--split test_unseen` to evaluate on unseen APIs instead.
+
+The script prints three metrics:
+
+- **Valid output rate**: the output parses as a JSON array of `{"name", "arguments"}` calls.
+- **Function-name accuracy**: the predicted function names match the expected ones.
+- **Exact-match accuracy**: both the function names and the arguments match exactly.
+
+Call order is ignored. Predictions (expected vs. predicted, plus the raw output) are saved to `results/baseline_predictions.jsonl`, which is ignored by Git.
