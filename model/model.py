@@ -22,7 +22,8 @@ class FunctionCallingModel:
             "float32": torch.float32,
         }[dtype]
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=load_dtype
+            model_name,
+            dtype=load_dtype,
         ).to(device)
         self.model.eval()
 
