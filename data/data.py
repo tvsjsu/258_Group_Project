@@ -2,7 +2,8 @@ import json
 import random
 
 from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
+from model.prompt import format_prompt
 
 class FunctionCallingDataset(Dataset):
     """One prepared split of function-calling examples."""
@@ -124,9 +125,35 @@ class FunctionCallingDataset(Dataset):
 
         return splits
 
-    def make_loader(self, batch_size=1, shuffle=False, num_workers=0):
+    def make_loader(
+        self,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        tokenizer=None,
+        group_by_length=False,
+    ):
+        dataset = self
+
+        if group_by_length:
+            if tokenizer is None:
+                raise ValueError(
+                    "A tokenizer is required when grouping by length."
+                )
+            if shuffle:
+                raise ValueError(
+                    "Use shuffle=False when grouping evaluation examples."
+                )
+
+            lengths = self.prompt_lengths(tokenizer)
+            indices = sorted(
+                range(len(self)),
+                key=lengths.__getitem__,
+            )
+            dataset = Subset(self, indices)
+
         return DataLoader(
-            self,
+            dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
@@ -138,3 +165,25 @@ class FunctionCallingDataset(Dataset):
     def _collate_examples(batch):
         """Keep each example's nested tools and answers intact."""
         return batch
+
+    def prompt_lengths(self, tokenizer):
+        """Count tokens in each complete, unpadded inference prompt."""
+        lengths = []
+
+        for example in self.examples:
+            messages = [{
+                "role": "user",
+                "content": format_prompt(
+                    example["query"],
+                    example["tools"],
+                ),
+            }]
+
+            token_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            lengths.append(len(token_ids))
+
+        return lengths

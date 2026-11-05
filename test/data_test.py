@@ -88,3 +88,24 @@ def test_loader_preserves_examples(examples):
     # Preserve order and all nested example contents.
     actual = [example for batch in batches for example in batch]
     assert actual == expected
+
+def test_length_grouping_preserves_examples(examples, monkeypatch):
+    expected = examples[:3]
+    dataset = FunctionCallingDataset(expected)
+
+    monkeypatch.setattr(
+        dataset,
+        "prompt_lengths",
+        lambda tokenizer: [30, 10, 20],
+    )
+
+    batches = list(dataset.make_loader(
+        batch_size=2,
+        tokenizer=object(),
+        group_by_length=True,
+    ))
+
+    assert [len(batch) for batch in batches] == [2, 1]
+
+    actual = [example for batch in batches for example in batch]
+    assert actual == [expected[1], expected[2], expected[0]]
