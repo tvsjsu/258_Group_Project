@@ -2,7 +2,7 @@ import json
 import random
 
 from datasets import load_dataset
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 class FunctionCallingDataset(Dataset):
     """One prepared split of function-calling examples."""
@@ -123,3 +123,18 @@ class FunctionCallingDataset(Dataset):
             splits[split] = kept
 
         return splits
+
+    def make_loader(self, batch_size=1, shuffle=False, num_workers=0):
+        return DataLoader(
+            self,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            collate_fn=self._collate_examples,
+            drop_last=False,
+        )
+
+    @staticmethod
+    def _collate_examples(batch):
+        """Keep each example's nested tools and answers intact."""
+        return batch

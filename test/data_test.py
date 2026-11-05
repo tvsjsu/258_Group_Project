@@ -75,3 +75,16 @@ def test_split_examples(examples):
 
     assert names["test_seen"] <= names["train"]
     assert names["validation"] <= names["train"]
+
+def test_loader_preserves_examples(examples):
+    expected = examples[:3]
+    dataset = FunctionCallingDataset(expected)
+
+    batches = list(dataset.make_loader(batch_size=2))
+
+    # Keep the final batch even though it contains only one example.
+    assert [len(batch) for batch in batches] == [2, 1]
+
+    # Preserve order and all nested example contents.
+    actual = [example for batch in batches for example in batch]
+    assert actual == expected
