@@ -2,28 +2,34 @@ import json
 
 import pytest
 
-from data.data import load_data, preprocess, split_examples, tool_names
+from data.data import FunctionCallingDataset
 
 
 @pytest.fixture(scope="module")
-def dataset():
-    return load_data()
+def raw_dataset():
+    return FunctionCallingDataset._load_data()
 
 
 @pytest.fixture(scope="module")
-def examples(dataset):
-    return preprocess(dataset)
+def examples(raw_dataset):
+    return FunctionCallingDataset._preprocess(raw_dataset)
 
 
-def test_load_data(dataset):
-    assert len(dataset) > 0
-    assert {"id", "query", "tools", "answers"} <= set(dataset.column_names)
+def test_load_data(raw_dataset):
+    assert len(raw_dataset) > 0
+    assert {
+        "id", "query", "tools", "answers"
+    } <= set(raw_dataset.column_names)
 
 
-def test_preprocess(dataset, examples):
-    assert len(examples) == len(dataset)
-    row = dataset[0]
-    result = examples[0]
+def test_preprocess(raw_dataset, examples):
+    wrapped = FunctionCallingDataset(examples)
+
+    assert len(wrapped) == len(raw_dataset)
+
+    row = raw_dataset[0]
+    result = wrapped[0]
+
     assert set(result) == {"id", "query", "tools", "answers"}
     assert result["id"] == row["id"]
     assert result["query"] == row["query"]
@@ -32,16 +38,40 @@ def test_preprocess(dataset, examples):
 
 
 def test_split_examples(examples):
-    splits = split_examples(examples)
-    assert splits == split_examples(examples)
-    all_rows = [row for group in splits.values() for row in group]
+    groups = FunctionCallingDataset._split_examples(examples)
+
+    assert groups == FunctionCallingDataset._split_examples(examples)
+
+    splits = {
+        name: FunctionCallingDataset(items)
+        for name, items in groups.items()
+    }
+
+    assert set(splits) == {
+        "train", "validation", "test_seen", "test_unseen"
+    }
+    assert all(len(dataset) > 0 for dataset in splits.values())
+
+    all_rows = [
+        row
+        for dataset in splits.values()
+        for row in dataset
+    ]
+
     assert len({row["id"] for row in all_rows}) == len(all_rows)
     assert len(all_rows) <= len(examples)
 
-    names = {split: {name for row in group for name in tool_names(row)}
-             for split, group in splits.items()}
+    names = {
+        split: {
+            name
+            for row in dataset
+            for name in FunctionCallingDataset._tool_names(row)
+        }
+        for split, dataset in splits.items()
+    }
+
     for split in ("train", "validation", "test_seen"):
         assert names[split].isdisjoint(names["test_unseen"])
+
     assert names["test_seen"] <= names["train"]
     assert names["validation"] <= names["train"]
-    assert all(splits.values())
