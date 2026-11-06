@@ -47,7 +47,42 @@ def format_prompt(query, tools):
     )
 
 def build_messages(query, tools):
+    example_tools = [
+        {
+            "name": "demo_set_temperature",
+            "description": "Set the temperature for a named room.",
+            "parameters": {
+                "room": {"type": "str", "required": True},
+                "temperature": {"type": "int", "required": True},
+            },
+        }
+    ]
+
+    example_calls = [
+        {
+            "name": "demo_set_temperature",
+            "arguments": {
+                "room": "office",
+                "temperature": 21,
+            },
+        }
+    ]
+
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": format_prompt(query, tools)},
+        {
+            "role": "user",
+            "content": format_prompt(
+                "Set the office temperature to 21 degrees.",
+                example_tools,
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": json.dumps(example_calls, ensure_ascii=False),
+        },
+        {
+            "role": "user",
+            "content": format_prompt(query, tools),
+        },
     ]
