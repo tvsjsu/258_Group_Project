@@ -205,7 +205,6 @@ def build_optimizer(name, model, lr, weight_decay):
 
 def parse_args(argv=None):
     from model.model import MODEL_NAME
-
     p = argparse.ArgumentParser(description="Full fine-tuning on the xLAM train split.")
     p.add_argument("--model", default=MODEL_NAME, help="Hugging Face id or local path.")
     p.add_argument("--output-dir", default="checkpoints/full")
@@ -229,6 +228,15 @@ def parse_args(argv=None):
     p.add_argument("--eval-every", type=int, default=0, help="Validation loss every N steps (0 = only before/after).")
     p.add_argument("--no-save", action="store_true", help="Skip writing the model checkpoint.")
     p.add_argument("--seed", type=int, default=42)
+
+    # Sample command line for a quick sanity check (20 optimizer steps on 400 train examples, 50 validation examples):
+    # uv run python -m train.finetune \
+    #   --limit-train 400 \
+    #   --limit-val 50 \
+    #   --max-steps 20 \
+    #   --log-every 1 \
+    #   --output-dir checkpoints/full_sanity
+
     args = p.parse_args(argv)
     for name in ("batch_size", "grad_accum", "max_length"):
         if getattr(args, name) < 1:
@@ -401,3 +409,4 @@ def main(argv=None, splits=None):
 
 if __name__ == "__main__":
     main()
+    
