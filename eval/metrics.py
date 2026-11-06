@@ -3,6 +3,9 @@ import json
 import math
 from collections import Counter, defaultdict
 from functools import lru_cache
+import io
+import re
+import tokenize
 
 from jsonschema import Draft202012Validator
 from scipy.optimize import linear_sum_assignment
@@ -81,6 +84,40 @@ _TYPES = {
     "none": "null", "nonetype": "null", "null": "null",
 }
 
+def _strip_type_metadata(hint):
+    """Remove optional/default annotations without splitting nested types."""
+    hint = hint.strip()
+    depth = 0
+
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(hint).readline):
+            if token.type != tokenize.OP:
+                continue
+
+            if token.string in ("[", "(", "{"):
+                depth += 1
+            elif token.string in ("]", ")", "}"):
+                depth -= 1
+            elif token.string == "," and depth == 0:
+                row, column = token.start
+                offset = (
+                    sum(map(len, hint.splitlines(keepends=True)[:row - 1]))
+                    + column
+                )
+                suffix = hint[offset + 1:].strip()
+
+                if re.fullmatch(
+                    r"(?:optional(?:\s*,\s*default\b[\s\S]+)?|default\b[\s\S]+)",
+                    suffix,
+                    re.I,
+                ):
+                    return hint[:offset].strip()
+
+                break
+    except (tokenize.TokenError, IndentationError):
+        pass
+
+    return hint
 
 def _type_schema(hint):
     """Translate common xLAM/Python type labels without executing type strings."""
@@ -88,12 +125,16 @@ def _type_schema(hint):
         return {"anyOf": [_type_schema(t) for t in hint]}
     if not isinstance(hint, str):
         raise ValueError(f"Unsupported parameter type: {hint!r}")
+    hint = _strip_type_metadata(hint)
 
     def convert(node):
         if isinstance(node, ast.Name):
             name = node.id.lower()
             if name == "any":
                 return {}
+            if name == "set":
+                # Evaluator convention: sets use JSON arrays without duplicates.
+                return {"type": "array", "uniqueItems": True}
             if name in _TYPES:
                 return {"type": _TYPES[name]}
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
@@ -114,6 +155,15 @@ def _type_schema(hint):
                 raise ValueError(f"Unsupported parameter type: {hint!r}")
             name = (base.id if isinstance(base, ast.Name) else base.attr).lower()
             args = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if name == "callable" and len(args) == 2 and (
+                isinstance(args[0], ast.List)
+                or (
+                    isinstance(args[0], ast.Constant)
+                    and args[0].value is Ellipsis
+                )
+            ):
+                # Dataset convention: callable arguments are serialized strings.
+                return {"type": "string"}
             if name in ("list", "array") and len(args) == 1:
                 return {"type": "array", "items": convert(args[0])}
             if name in ("dict", "dictionary") and len(args) == 2:
@@ -230,14 +280,42 @@ def compile_tools(tools):
 
 
 def validate_examples(examples):
-    """Check references and all supplied schemas before loading model weights."""
+    """Collect distinct schema issues before loading model weights."""
+    issues = {}
+
+    def record(exc, example, tool=None):
+        message = str(exc.__cause__ or exc)
+        issue = issues.setdefault(message, {
+            "error": message,
+            "occurrences": 0,
+            "example": f"Example {example.get('id')!r}",
+            "tool": tool,
+            "answers": example.get("answers"),
+        })
+        issue["occurrences"] += 1
+
     for example in examples:
-        try:
-            if not _valid_calls(example["answers"]):
-                raise ValueError("Invalid reference call structure")
-            compile_tools(example["tools"])
-        except Exception as exc:
-            raise ValueError(f"Example {example.get('id')!r}: {exc}") from exc
+        if not _valid_calls(example.get("answers")):
+            record(
+                ValueError("Invalid reference call structure"),
+                example,
+            )
+
+        for tool in example["tools"]:
+            try:
+                compile_tools([tool])
+            except Exception as exc:
+                record(exc, example, tool)
+
+    if issues:
+        raise ValueError(
+            f"Schema preflight found {len(issues)} distinct issues:\n"
+            + json.dumps(
+                list(issues.values()),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
 
 
 def _argument_counts(predicted, expected):
