@@ -1,11 +1,30 @@
 import json
 
 
-PROMPT_TEMPLATE = """Select the functions needed to fulfill the user request using the available definitions.
-Return only a JSON array of function calls. Each call must contain exactly two keys:
-"name" (a function name string) and "arguments" (an object of argument names and values).
-Include every requested call. Use only the supplied functions and their defined parameters.
-Do not include explanations or Markdown.
+PROMPT_TEMPLATE = """Generate the function calls needed to fulfill the user request using the available function definitions.
+
+Function selection:
+- Use only available functions that are needed for the request.
+- Include every requested operation.
+- Include separate calls when the same function must be invoked multiple times.
+- Use function and parameter names exactly as defined.
+
+Arguments:
+- Include all explicitly required parameters and all parameters needed to fulfill the request.
+- Use values stated in or clearly implied by the request and function definitions.
+- Match the declared parameter types and constraints.
+- A default value is a fallback, not a restriction on the values a parameter can accept.
+- Represent lists and tuples as JSON arrays.
+- Represent sets as JSON arrays with unique elements.
+- Represent callable arguments as strings containing the function representation.
+- Use JSON objects for dictionaries and JSON literals true, false, and null where appropriate.
+
+Output:
+- Return exactly one valid JSON array.
+- Each array element must contain exactly two keys: "name" (a string) and "arguments" (an object).
+- Use double quotes for JSON keys and strings.
+- Return function calls without executing them or providing their results.
+- Do not include explanations, Markdown fences, or text outside the JSON array.
 
 Available functions:
 {tools}
@@ -16,4 +35,7 @@ User request:
 
 
 def format_prompt(query, tools):
-    return PROMPT_TEMPLATE.format(query=query, tools=json.dumps(tools, ensure_ascii=False))
+    return PROMPT_TEMPLATE.format(
+        query=query,
+        tools=json.dumps(tools, ensure_ascii=False),
+    )
