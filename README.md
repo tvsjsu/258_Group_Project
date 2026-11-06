@@ -70,3 +70,45 @@ The script prints three metrics:
 - **Exact-match accuracy**: both the function names and the arguments match exactly.
 
 Call order is ignored. Predictions (expected vs. predicted, plus the raw output) are saved to `results/baseline_predictions.jsonl`, which is ignored by Git.
+
+## Run full fine-tuning
+
+`train/finetune.py` trains every weight of the base model on the `train` split, using the same prompt as the baseline evaluation. This requires the [Hugging Face login](#hugging-face-login) above. A GPU is used automatically if available, then Apple Silicon (MPS), then CPU.
+
+Start with a short test run to confirm that everything works on your machine:
+
+```bash
+uv run python -m train.finetune --max-steps 20 --limit-train 400 --limit-val 50
+```
+
+Then run the full training (one epoch by default):
+
+```bash
+uv run python -m train.finetune
+```
+
+The model is only saved when training finishes, so stopping a run early loses its progress.
+
+Common options (run `uv run python -m train.finetune --help` for all of them):
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--output-dir` | `checkpoints/full` | Where to save the model and metrics. |
+| `--epochs` | `1.0` | Number of passes over the training data. |
+| `--max-steps` | none | Stop after this many optimizer steps (overrides `--epochs`). |
+| `--limit-train` | all | Use only the first N training examples. |
+| `--limit-val` | `100` | Validation examples used for loss (`0` to skip). |
+| `--batch-size` | `1` | Examples per forward pass. |
+| `--grad-accum` | `8` | Forward passes per optimizer step. |
+| `--lr` | `2e-5` | Learning rate. |
+| `--max-length` | `2048` | Drop examples longer than this many tokens. |
+| `--device` | auto | Force a device, such as `cuda`, `mps`, or `cpu`. |
+| `--no-save` | off | Skip saving the model (metrics are still written). |
+
+If you run out of memory, add `--gradient-checkpointing`, switch to `--optim adafactor`, or lower `--max-length`:
+
+```bash
+uv run python -m train.finetune --gradient-checkpointing --optim adafactor --max-length 1024
+```
+
+The script prints the training time, peak memory, trainable parameter count, validation loss before and after training, and checkpoint size. These are also saved to `train_metrics.json` in the output directory, next to the model checkpoint.
