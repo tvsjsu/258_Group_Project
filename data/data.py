@@ -3,7 +3,7 @@ import random
 
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset
-from model.prompt import format_prompt
+from model.prompt import build_messages
 
 class FunctionCallingDataset(Dataset):
     """One prepared split of function-calling examples."""
@@ -171,13 +171,7 @@ class FunctionCallingDataset(Dataset):
         lengths = []
 
         for example in self.examples:
-            messages = [{
-                "role": "user",
-                "content": format_prompt(
-                    example["query"],
-                    example["tools"],
-                ),
-            }]
+            messages = build_messages(example["query"], example["tools"])
 
             token_ids = tokenizer.apply_chat_template(
                 messages,

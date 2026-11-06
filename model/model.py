@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from model.prompt import format_prompt
+from model.prompt import build_messages
 
 
 MODEL_NAME = "deepseek-ai/deepseek-coder-1.3b-instruct"
@@ -39,7 +39,7 @@ class FunctionCallingModel:
             return []
         prompts = []
         for query, definitions in zip(queries, tools):
-            messages = [{"role": "user", "content": format_prompt(query, definitions)}]
+            messages = build_messages(query, definitions)
             prompts.append(self.tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
             ))

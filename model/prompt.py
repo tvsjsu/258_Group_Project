@@ -1,5 +1,11 @@
 import json
 
+SYSTEM_PROMPT = """You select API calls from supplied function definitions.
+Respond only with a valid JSON array of call objects.
+Each object must contain exactly two keys: "name" and "arguments".
+Output call data only.
+Do not write Python programs, function implementations, explanations, or Markdown.
+"""
 
 PROMPT_TEMPLATE = """Generate the function calls needed to fulfill the user request using the available function definitions.
 
@@ -39,3 +45,9 @@ def format_prompt(query, tools):
         query=query,
         tools=json.dumps(tools, ensure_ascii=False),
     )
+
+def build_messages(query, tools):
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": format_prompt(query, tools)},
+    ]
