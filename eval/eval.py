@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 from contextlib import nullcontext
 from pathlib import Path
 from time import perf_counter
@@ -8,7 +7,11 @@ from time import perf_counter
 from eval.metrics import parse_calls, print_summary, score, summarize, validate_examples
 
 
-def main(argv=None):
+METRIC_PROTOCOL = "strict-json-v1"
+
+
+def parse_args(argv=None):
+    """Parse and validate evaluation options."""
     parser = argparse.ArgumentParser(
         description="Evaluate a Hugging Face causal language model or local full-model checkpoint with five function-calling metrics."
     )
@@ -33,94 +36,138 @@ def main(argv=None):
         parser.error("--batch-size must be at least 1")
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be at least 1")
+    return args
 
+
+def prepare_splits(split, limit=None):
+    """Load, select, and validate examples before loading the model."""
     from data.data import FunctionCallingDataset
 
     splits = FunctionCallingDataset.load_splits()
-    selected_splits = ["test_seen", "test_unseen"] if args.split == "both" else [args.split]
+    selected_splits = ["test_seen", "test_unseen"] if split == "both" else [split]
     selected = {
-        name: FunctionCallingDataset(splits[name][:args.limit])
+        name: FunctionCallingDataset(splits[name][:limit])
         for name in selected_splits
     }
     for name, examples in selected.items():
         validate_examples(examples)
         print(f"Schema preflight passed: {name}, {len(examples)} examples", flush=True)
-    if args.check_data_only:
-        return
+    return selected
 
+
+def load_model(model_name=None, *, device=None, dtype="auto"):
+    """Load the requested model and return it with its resolved name."""
     # Model imports stay here so metric tests do not load PyTorch/model weights.
     from model.model import MODEL_NAME, FunctionCallingModel
 
-    model_name = args.model if args.model is not None else MODEL_NAME
-    model = FunctionCallingModel(model_name=model_name, device=args.device, dtype=args.dtype)
+    model_name = model_name if model_name is not None else MODEL_NAME
+    model = FunctionCallingModel(model_name=model_name, device=device, dtype=dtype)
+    return model, model_name
+
+
+def evaluate_split(model, name, examples, *, batch_size=1, max_new_tokens=512, prediction_stream=None):
+    """Generate and score one split, optionally writing prediction records."""
+    loader = examples.make_loader(
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    scores = []
+    done = 0
+    started = perf_counter()
+    for batch in loader:
+        outputs = model.generate_batch(
+            [example["query"] for example in batch],
+            [example["tools"] for example in batch],
+            max_new_tokens=max_new_tokens,
+        )
+        if len(outputs) != len(batch):
+            raise RuntimeError("Model returned a different number of outputs than inputs")
+        for example, output in zip(batch, outputs):
+            predicted = parse_calls(output)
+            result = score(predicted, example["answers"], example["tools"])
+            scores.append(result)
+            if prediction_stream is not None:
+                prediction_stream.write(json.dumps({
+                    "metric_protocol": METRIC_PROTOCOL,
+                    "split": name,
+                    "id": example["id"],
+                    "query": example["query"],
+                    "tools": example["tools"],
+                    "expected": example["answers"],
+                    "predicted": predicted,
+                    "raw_output": output,
+                    **result,
+                }, ensure_ascii=False, allow_nan=False) + "\n")
+        done += len(batch)
+        elapsed = perf_counter() - started
+        print(f"[{name} {done}/{len(examples)}] {done / max(elapsed, 1e-9):.2f} examples/s", flush=True)
+    print_summary(name, scores)
+    return scores
+
+
+def evaluate_model(model, model_name, splits, *, batch_size=1, max_new_tokens=512, output_path=None):
+    """Evaluate selected splits and aggregate their scores into one report."""
     report = {
-        "metric_protocol": "strict-json-v1",
+        "metric_protocol": METRIC_PROTOCOL,
         "settings": {
             "model": model_name,
             "dtype": str(model.model.dtype),
             "device": str(model.model.device),
             "seed": 42,
             "unseen_fraction": 0.2,
-            "batch_size": args.batch_size,
-            "max_new_tokens": args.max_new_tokens,
+            "batch_size": batch_size,
+            "max_new_tokens": max_new_tokens,
             "group_by_length": False,
         },
         "splits": {},
     }
     all_scores = []
-    if not args.no_output:
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    if output_path is not None:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    output_context = nullcontext() if args.no_output else open(args.output, "w", encoding="utf-8")
+    output_context = nullcontext() if output_path is None else open(output_path, "w", encoding="utf-8")
     with output_context as stream:
-        for name, examples in selected.items():
-            loader = examples.make_loader(
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=0,
+        for name, examples in splits.items():
+            scores = evaluate_split(
+                model, name, examples,
+                batch_size=batch_size,
+                max_new_tokens=max_new_tokens,
+                prediction_stream=stream,
             )
-            scores = []
-            done = 0
-            started = perf_counter()
-            for batch in loader:
-                outputs = model.generate_batch(
-                    [example["query"] for example in batch],
-                    [example["tools"] for example in batch],
-                    max_new_tokens=args.max_new_tokens,
-                )
-                if len(outputs) != len(batch):
-                    raise RuntimeError("Model returned a different number of outputs than inputs")
-                for example, output in zip(batch, outputs):
-                    predicted = parse_calls(output)
-                    result = score(predicted, example["answers"], example["tools"])
-                    scores.append(result)
-                    if stream is not None:
-                        stream.write(json.dumps({
-                            "metric_protocol": "strict-json-v1",
-                            "split": name,
-                            "id": example["id"],
-                            "query": example["query"],
-                            "tools": example["tools"],
-                            "expected": example["answers"],
-                            "predicted": predicted,
-                            "raw_output": output,
-                            **result,
-                        }, ensure_ascii=False, allow_nan=False) + "\n")
-                done += len(batch)
-                elapsed = perf_counter() - started
-                print(f"[{name} {done}/{len(examples)}] {done / max(elapsed, 1e-9):.2f} examples/s", flush=True)
-            print_summary(name, scores)
             report["splits"][name] = summarize(scores)
             all_scores.extend(scores)
 
     report["combined"] = summarize(all_scores)
-    if args.split == "both":
+    if len(splits) > 1:
         print_summary("combined", all_scores)
-    if not args.no_output:
-        summary_path = Path(args.output).with_suffix(".metrics.json")
-        summary_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
-        print(f"Predictions saved to {args.output}")
-        print(f"Metrics saved to {summary_path}")
+    return report
+
+
+def save_report(report, output_path):
+    """Save aggregate metrics alongside the predictions file."""
+    summary_path = Path(output_path).with_suffix(".metrics.json")
+    summary_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+    print(f"Predictions saved to {output_path}")
+    print(f"Metrics saved to {summary_path}")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    splits = prepare_splits(args.split, args.limit)
+    if args.check_data_only:
+        return
+
+    model, model_name = load_model(args.model, device=args.device, dtype=args.dtype)
+    output_path = None if args.no_output else args.output
+    report = evaluate_model(
+        model, model_name, splits,
+        batch_size=args.batch_size,
+        max_new_tokens=args.max_new_tokens,
+        output_path=output_path,
+    )
+    if output_path is not None:
+        save_report(report, output_path)
     return report
 
 
