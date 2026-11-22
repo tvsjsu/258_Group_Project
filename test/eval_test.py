@@ -238,11 +238,12 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(score([call("f", y="ok")], [], tools)["schema_compliant"])
 
 
-class BaselineIntegrationTests(unittest.TestCase):
+class EvaluationIntegrationTests(unittest.TestCase):
     """Exercise CLI, serialization and aggregation with model/data test doubles."""
 
     def setUp(self):
         self.model_loads = 0
+        self.model_settings = []
         owner = self
         rows = [{"id": i, "query": f"q{i}", "tools": TOOLS, "answers": EXPECTED}
                 for i in range(3)]
@@ -270,6 +271,7 @@ class BaselineIntegrationTests(unittest.TestCase):
         class FakeModel:
             def __init__(self, **kwargs):
                 owner.model_loads += 1
+                owner.model_settings.append(kwargs)
                 self.model = types.SimpleNamespace(dtype="torch.bfloat16", device="cpu")
 
             def generate_batch(self, queries, tools, max_new_tokens):
@@ -291,10 +293,10 @@ class BaselineIntegrationTests(unittest.TestCase):
         self.modules = modules
 
     def run_cli(self, *arguments):
-        from eval.baseline import main
+        from eval.eval import main
         output = io.StringIO()
         with patch.dict(sys.modules, self.modules), patch.object(
-            sys, "argv", ["baseline", *arguments]
+            sys, "argv", ["eval", *arguments]
         ), contextlib.redirect_stdout(output):
             main()
         return output.getvalue()
@@ -316,16 +318,28 @@ class BaselineIntegrationTests(unittest.TestCase):
             self.assertEqual(report["combined"]["argument_accuracy"], 0.5)
             self.assertIn("Argument accuracy", text)
             self.assertIn("Schema compliance", text)
+            self.assertEqual(self.model_settings[-1]["model_name"], "test-double")
+            self.assertEqual(report["settings"]["model"], "test-double")
+
+    def test_hub_model_and_local_checkpoint_selection(self):
+        for model_name in ("example/another-pretrained-model", "checkpoints/full"):
+            with self.subTest(model=model_name), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory, "predictions.jsonl")
+                self.run_cli("--model", model_name, "--limit", "1", "--output", str(output))
+                report = json.loads(output.with_suffix(".metrics.json").read_text(encoding="utf-8"))
+                self.assertEqual(self.model_settings[-1]["model_name"], model_name)
+                self.assertEqual(report["settings"]["model"], model_name)
+                self.assertEqual(report["combined"]["complete_call_accuracy"], 1.0)
 
     def test_limit_and_no_output(self):
         with tempfile.TemporaryDirectory() as directory:
             # No-output and output are mutually exclusive; the default must not be used.
-            with patch("eval.baseline.open", side_effect=AssertionError("unexpected file write"), create=True):
+            with patch("eval.eval.open", side_effect=AssertionError("unexpected file write"), create=True):
                 text = self.run_cli("--split", "validation", "--limit", "1", "--no-output")
             self.assertIn("Examples: 1", text)
 
     def test_preflight_does_not_load_model(self):
-        self.run_cli("--split", "both", "--check-data-only")
+        self.run_cli("--model", "example/another-pretrained-model", "--split", "both", "--check-data-only")
         self.assertEqual(self.model_loads, 0)
 
     def test_invalid_schema_stops_before_model_loading(self):
