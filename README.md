@@ -30,85 +30,88 @@ Paste your token when prompted. If asked to add it as a Git credential, choose *
 
 ## Run tests
 
-Run all tests:
+After setup and Hugging Face login, run all tests:
 
 ```bash
 uv run pytest -v
 ```
 
-Run only the data tests:
+## Prepare the baseline data splits
 
-```bash
-uv run pytest -v -k data_test
+Use these shared settings for all training methods: `seed=42`, `unseen_fraction=0.2`.
+
+```python
+from data.data import FunctionCallingDataset
+
+splits = FunctionCallingDataset.load_splits(seed=42, unseen_fraction=0.2)
+for name, dataset in splits.items():
+    print(f"{name}: {len(dataset)}")
 ```
 
-Run only the model tests:
-
-```bash
-uv run pytest -v -k model_test
-```
-Run only the eval tests (no model or dataset download):
-
-```bash
-uv run pytest -v -k eval_test
-```
-
-## Run baseline evaluation
-
-Evaluate the base model (no fine-tuned adapter) on the held-out `test_seen` split. This requires the [Hugging Face login](#hugging-face-login) above. The first run downloads the dataset and the ~1.3B model (~3 GB). A GPU is used automatically if available; on Apple Silicon add `--device mps`, since CPU-only runs are slow.
-
-```bash
-uv run python -m eval.baseline --limit 100
-```
-
-`--limit` sets how many examples to evaluate (default 100). Use `--split test_unseen` to evaluate on unseen APIs instead.
-
-The script prints three metrics:
-
-- **Valid output rate**: the output parses as a JSON array of `{"name", "arguments"}` calls.
-- **Function-name accuracy**: the predicted function names match the expected ones.
-- **Exact-match accuracy**: both the function names and the arguments match exactly.
-
-Call order is ignored. Predictions (expected vs. predicted, plus the raw output) are saved to `results/baseline_predictions.jsonl`, which is ignored by Git.
+Expected test sizes: `test_seen: 3333`, `test_unseen: 3937`. Evaluation recreate the splits automatically.
 
 ## Run full fine-tuning
 
-`train/finetune.py` trains every weight of the base model on the `train` split, using the same prompt as the baseline evaluation. This requires the [Hugging Face login](#hugging-face-login) above. A GPU is used automatically if available, then Apple Silicon (MPS), then CPU.
-
-Start with a short test run to confirm that everything works on your machine:
-
 ```bash
-uv run python -m train.finetune --max-steps 20 --limit-train 400 --limit-val 50
+uv run python -m train.finetune --limit-val all --output-dir checkpoints/full
 ```
 
-Then run the full training (one epoch by default):
+The output folder contains the model/tokenizer and these report files:
+
+- `train_metrics.json`: training/validation loss, time, memory, parameter counts, model/checkpoint sizes, settings, and hardware/software details.
+- `training_history.jsonl`: loss, learning rate, gradient norm, and example/token counts for each optimizer step.
+- `data_splits.json`: ordered split IDs and fingerprints, plus retained/dropped training and validation IDs after length filtering.
+
+The command uses the full validation split; omit `--limit-val all` to use the default 100 examples. Run the saved checkpoint through the evaluator below to obtain the five function-calling metrics.
+
+## Run evaluation
+
+Check the evaluation data without loading the model:
 
 ```bash
-uv run python -m train.finetune
+uv run python -m eval.eval --split both --check-data-only
 ```
 
-The model is only saved when training finishes, so stopping a run early loses its progress.
-
-Common options (run `uv run python -m train.finetune --help` for all of them):
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `--output-dir` | `checkpoints/full` | Where to save the model and metrics. |
-| `--epochs` | `1.0` | Number of passes over the training data. |
-| `--max-steps` | none | Stop after this many optimizer steps (overrides `--epochs`). |
-| `--limit-train` | all | Use only the first N training examples. |
-| `--limit-val` | `100` | Validation examples used for loss (`0` to skip). |
-| `--batch-size` | `1` | Examples per forward pass. |
-| `--grad-accum` | `8` | Forward passes per optimizer step. |
-| `--lr` | `2e-5` | Learning rate. |
-| `--max-length` | `2048` | Drop examples longer than this many tokens. |
-| `--device` | auto | Force a device, such as `cuda`, `mps`, or `cpu`. |
-| `--no-save` | off | Skip saving the model (metrics are still written). |
-
-If you run out of memory, add `--gradient-checkpointing`, switch to `--optim adafactor`, or lower `--max-length`:
+Run the full baseline evaluation on a GPU:
 
 ```bash
-uv run python -m train.finetune --gradient-checkpointing --optim adafactor --max-length 1024
+uv run python -m eval.eval \
+  --model deepseek-ai/deepseek-coder-1.3b-instruct \
+  --split both \
+  --batch-size 8 \
+  --dtype bfloat16 \
+  --device cuda \
+  --max-new-tokens 512 \
+  --output results/baseline_full_one_shot_rerun.jsonl
 ```
 
-The script prints the training time, peak memory, trainable parameter count, validation loss before and after training, and checkpoint size. These are also saved to `train_metrics.json` in the output directory, next to the model checkpoint.
+Outputs: `results/baseline_full_one_shot_rerun.jsonl` and `results/baseline_full_one_shot_rerun.metrics.json`.
+
+Run the same evaluation on a fine-tuned full-model checkpoint:
+
+```bash
+uv run python -m eval.eval \
+  --model checkpoints/full \
+  --split both \
+  --batch-size 8 \
+  --dtype bfloat16 \
+  --device cuda \
+  --max-new-tokens 512 \
+  --output results/full_finetuned_predictions.jsonl
+```
+
+`--model` accepts a Hugging Face model ID or local full-model checkpoint directory, including its tokenizer files. It defaults to the original DeepSeek model when omitted. Metrics are saved alongside predictions with the suffix `.metrics.json`.
+
+### Evaluation metrics
+
+The script reports these five metrics for each test split and the combined results:
+
+| Metric | What it measures |
+| --- | --- |
+| **Valid-call rate** | Fraction of outputs that parse as strict JSON arrays with the required `name` and `arguments` call structure. |
+| **Function accuracy** | Fraction of examples where the predicted function names and call counts match the reference. |
+| **Argument accuracy** | Fraction of argument slots with correct values after matching calls by function name; missing and extra arguments count against the score. |
+| **Schema compliance** | Fraction of examples where every generated call names an available function and satisfies its parameter schema. |
+| **Complete-call accuracy** | Fraction of examples where all function names and arguments match the reference, including call counts. |
+
+Call order is ignored when scoring. Argument accuracy is aggregated over argument slots; the other four metrics are aggregated over examples.
