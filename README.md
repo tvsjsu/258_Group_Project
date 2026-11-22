@@ -50,6 +50,20 @@ for name, dataset in splits.items():
 
 Expected test sizes: `test_seen: 3333`, `test_unseen: 3937`. Evaluation recreate the splits automatically.
 
+## Run full fine-tuning
+
+```bash
+uv run python -m train.finetune --limit-val all --output-dir checkpoints/full
+```
+
+The output folder contains the model/tokenizer and these report files:
+
+- `train_metrics.json`: training/validation loss, time, memory, parameter counts, model/checkpoint sizes, settings, and hardware/software details.
+- `training_history.jsonl`: loss, learning rate, gradient norm, and example/token counts for each optimizer step.
+- `data_splits.json`: ordered split IDs and fingerprints, plus retained/dropped training and validation IDs after length filtering.
+
+The command uses the full validation split; omit `--limit-val all` to use the default 100 examples. Run the saved checkpoint through the evaluator below to obtain the five function-calling metrics.
+
 ## Run evaluation
 
 Check the evaluation data without loading the model:
