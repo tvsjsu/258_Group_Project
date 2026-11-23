@@ -42,10 +42,10 @@ def resolve_precision(precision, device):
 
 
 def autocast(device, dtype):
-    """Create an autocast context when mixed-precision computation is enabled."""
+    """Use mixed precision without retaining cached lower-precision weight copies."""
     if dtype is None:
         return nullcontext()
-    return torch.autocast(device_type=device.type, dtype=dtype)
+    return torch.autocast(device_type=device.type, dtype=dtype, cache_enabled=False)
 
 
 def synchronize(device):
@@ -56,11 +56,17 @@ def synchronize(device):
         torch.mps.synchronize()
 
 
+def validate_optimizer_device(name, device):
+    """Reject unsupported 8-bit optimizer devices without silently changing the recipe."""
+    if name == "adamw8bit" and device.type != "cuda":
+        raise ValueError("--optim adamw8bit requires CUDA in this trainer. Use --optim adamw on CPU/MPS; keep the optimizer consistent across final comparison runs.")
+
+
 def require_cuda(device, precision):
     """Resolve a concrete CUDA device for methods that require NVIDIA hardware."""
     resolved = pick_device(device)
     if resolved.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("QLoRA requires an NVIDIA CUDA GPU. Install dependencies with: uv sync --extra qlora")
+        raise RuntimeError("QLoRA requires an NVIDIA CUDA GPU. Install dependencies with: uv sync")
     resolved = torch.device("cuda", resolved.index if resolved.index is not None else torch.cuda.current_device())
     torch.cuda.set_device(resolved)
     if precision.startswith("bf16") and not torch.cuda.is_bf16_supported():

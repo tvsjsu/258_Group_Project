@@ -99,6 +99,34 @@ def checkpoint_sizes(output_dir, tokenizer_files):
     }
 
 
+def optimizer_report(optimizer, name):
+    """Describe optimizer settings, actual state dtypes, and logical tensor bytes."""
+    state_bytes = {}
+    for state in optimizer.state.values():
+        for value in state.values():
+            if isinstance(value, torch.Tensor):
+                dtype = str(value.dtype)
+                state_bytes[dtype] = state_bytes.get(dtype, 0) + value.numel() * value.element_size()
+    report = {
+        "name": name,
+        "implementation": f"{type(optimizer).__module__}.{type(optimizer).__name__}",
+        **{key: list(value) if isinstance(value, tuple) else value
+           for key, value in optimizer.defaults.items() if key in ("lr", "betas", "eps", "weight_decay")},
+        "state_tensor_bytes_by_dtype": state_bytes,
+        "state_tensor_bytes": sum(state_bytes.values()),
+        "state_tensor_bytes_scope": "logical tensor bytes; shared tensors may be counted more than once; excludes allocator overhead",
+    }
+    if name == "adamw8bit":
+        report.update({
+            "configured_state_bits": 8, "small_tensor_state_bits": 32,
+            "min_8bit_size": optimizer.args.min_8bit_size,
+            "block_wise": optimizer.args.block_wise,
+            "percentile_clipping": optimizer.args.percentile_clipping,
+            "is_paged": optimizer.is_paged,
+        })
+    return report
+
+
 class MemoryTracker:
     """Track training intervals; keep platform-specific measurement labels."""
 
@@ -186,6 +214,7 @@ def build_report(*, args, method, model, device, precision, weight_dtype, autoca
         "precision": precision,
         "weight_dtype": str(weight_dtype),
         "autocast_dtype": str(autocast_dtype) if autocast_dtype is not None else None,
+        "autocast_weight_cache_enabled": False,
         "settings": {key: value for key, value in vars(args).items() if key not in ("model", "device")},
         "environment": environment,
         "code_sha256": code_hashes,

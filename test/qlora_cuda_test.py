@@ -7,7 +7,7 @@ import torch
 
 @pytest.mark.skipif(
     os.environ.get("RUN_QLORA_CUDA_TEST") != "1" or not torch.cuda.is_available(),
-    reason="Set RUN_QLORA_CUDA_TEST=1 on a CUDA machine with the qlora extra installed",
+    reason="Set RUN_QLORA_CUDA_TEST=1 on a CUDA machine with the project dependencies installed",
 )
 def test_real_nf4_training_and_adapter_reload(tmp_path, monkeypatch):
     """Verify real NF4 training and adapter reload."""

@@ -42,6 +42,14 @@ uv run pytest test/qlora_cuda_test.py -v -s -rs
 set RUN_QLORA_CUDA_TEST=
 ```
 
+Optional 8-bit AdamW training/resume tests for all three methods (Windows CMD):
+
+```cmd
+set RUN_8BIT_ADAMW_CUDA_TEST=1
+uv run pytest test/optimizer_cuda_test.py -v -s -rs
+set RUN_8BIT_ADAMW_CUDA_TEST=
+```
+
 ## Shared data
 
 Training and evaluation recreate the same splits using `seed=42` and `unseen_fraction=0.2`. Expected test sizes: **3,333 seen-tool** and **3,937 unseen-tool** examples.
@@ -64,7 +72,8 @@ All methods use the shared `train/trainer.py`.
 | LoRA | `1e-4` | 1 × 16 |
 | QLoRA | `1e-4` | 2 × 8 |
 
-Shared defaults: **four epochs**, effective batch size 16, AdamW, cosine scheduling, 3% warmup, a 2,048-token cutoff, and gradient checkpointing. LoRA/QLoRA use rank 16, alpha 32, dropout 0.05, and all linear target layers.
+Shared defaults: **four epochs**, effective batch size 16, **bitsandbytes 8-bit AdamW** (`--optim adamw8bit`), cosine scheduling, 3% warmup, a 2,048-token cutoff, and gradient checkpointing. LoRA/QLoRA use rank 16, alpha 32, dropout 0.05, and all linear target layers.
+
 Full fine-tuning:
 
 ```cmd

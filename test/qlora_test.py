@@ -113,7 +113,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
     def run(folder, resume=None):
         """Execute a small training job with optional checkpoint recovery."""
         folder.mkdir()
-        options = ["--device", "cpu", "--precision", "fp32", "--epochs", "2",
+        options = ["--device", "cpu", "--precision", "fp32", "--optim", "adamw", "--epochs", "2",
                    "--grad-accum", "3", "--save-steps", "1", "--eval-every", "1",
                    "--output-dir", str(folder), "--no-gradient-checkpointing"]
         if resume:

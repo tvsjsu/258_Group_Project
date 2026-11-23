@@ -160,7 +160,7 @@ def test_four_epochs_best_retention_and_resume(tmp_path, adapter):
         """Execute a small training job with optional checkpoint recovery."""
         folder.mkdir()
         args = config.parse_args([
-            "--device", "cpu", "--precision", "fp32", "--epochs", "4",
+            "--device", "cpu", "--precision", "fp32", "--optim", "adamw", "--epochs", "4",
             "--batch-size", "2", "--grad-accum", "2", "--lr", "0.001",
             "--save-steps", "1", "--no-gradient-checkpointing", "--output-dir", str(folder),
             "--generation-checks-per-epoch", "2",
@@ -357,7 +357,7 @@ def test_full_main_real_generation_export_and_resume(tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(CheckpointManager, "save", capture)
-    common = ["--model", str(base), "--device", "cpu", "--precision", "fp32",
+    common = ["--model", str(base), "--device", "cpu", "--precision", "fp32", "--optim", "adamw",
               "--epochs", "4", "--batch-size", "2", "--grad-accum", "1",
               "--generation-batch-size", "2", "--generation-max-new-tokens", "2",
               "--save-steps", "2", "--no-gradient-checkpointing"]

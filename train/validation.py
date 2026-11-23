@@ -3,7 +3,6 @@
 import gc
 import json
 import time
-from contextlib import nullcontext
 
 import torch
 
@@ -82,9 +81,7 @@ def generation_metrics(model, tokenizer, examples, args, device, autocast_dtype,
         with temporary.open("w", encoding="utf-8") as stream:
             for offset in range(0, len(examples), args.generation_batch_size):
                 batch = examples[offset:offset + args.generation_batch_size]
-                context = (torch.autocast(device_type=device.type, dtype=autocast_dtype)
-                           if autocast_dtype is not None else nullcontext())
-                with context:
+                with autocast(device, autocast_dtype):
                     outputs = wrapper.generate_batch(
                         [row["query"] for row in batch], [row["tools"] for row in batch],
                         max_new_tokens=args.generation_max_new_tokens,

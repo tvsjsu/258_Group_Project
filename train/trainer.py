@@ -12,22 +12,33 @@ from train.checkpointing import CheckpointManager, prepare_output_directory
 from train.preparation import IGNORE_INDEX, make_loaders, prepare_data
 from train.reporting import (
     MemoryTracker, build_report, checkpoint_sizes, environment_info,
-    parameter_counts, print_report, source_hashes, write_history, write_json,
+    optimizer_report, parameter_counts, print_report, source_hashes, write_history, write_json,
 )
-from train.runtime import ModelContext, autocast, pick_device, resolve_precision, synchronize
+from train.runtime import ModelContext, autocast, pick_device, resolve_precision, synchronize, validate_optimizer_device
 from train import validation
 from train.validation import timed_validation
 
 
 def build_optimizer(name, model, lr, weight_decay):
-    """Create the requested optimizer with the configured learning rate and weight decay."""
+    """Optimize trainable parameters with explicit, shared AdamW hyperparameters."""
+    if name not in {"adamw8bit", "adamw", "adafactor"}:
+        raise ValueError(f"Unknown optimizer: {name}")
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if name == "adamw8bit":
+        for parameter in parameters:
+            validate_optimizer_device(name, parameter.device)
+        from bitsandbytes.optim import AdamW8bit
+        return AdamW8bit(
+            parameters, lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay,
+            min_8bit_size=4096, percentile_clipping=100, block_wise=True, is_paged=False,
+        )
     if name == "adafactor":
         from transformers.optimization import Adafactor
         return Adafactor(
-            model.parameters(), lr=lr, weight_decay=weight_decay,
+            parameters, lr=lr, weight_decay=weight_decay,
             scale_parameter=False, relative_step=False, warmup_init=False,
         )
-    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    return torch.optim.AdamW(parameters, lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay)
 
 
 def training_plan(batches_per_epoch, grad_accum, epochs, max_steps=None):
@@ -306,9 +317,7 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
         "last_model_path": ".",
         "lr_scheduler": args.lr_scheduler,
         "warmup_steps": warmup_steps,
-        "optimizer_settings": {key: list(value) if isinstance(value, tuple) else value
-                               for key, value in optimizer.defaults.items()
-                               if key in ("lr", "betas", "eps", "weight_decay")},
+        "optimizer_settings": optimizer_report(optimizer, args.optim),
         "early_stopping": False,
     }
 
@@ -319,6 +328,7 @@ def run_experiment(args, build_model, *, method, splits=None, describe_model=Non
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
+    validate_optimizer_device(args.optim, device)
     (weight_dtype, autocast_dtype), precision = resolve_precision(args.precision, device)
     checkpoints = CheckpointManager(args) if not args.no_save else None
     state = checkpoints.state if checkpoints is not None else None

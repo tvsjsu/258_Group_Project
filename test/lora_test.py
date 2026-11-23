@@ -18,6 +18,7 @@ def test_three_final_recipes_share_monitoring_and_effective_batch():
     full, lora, qlora = full_args([]), parse_args([]), qlora_args([])
     assert [args.lr for args in (full, lora, qlora)] == [5e-6, 1e-4, 1e-4]
     for args in (full, lora, qlora):
+        assert args.optim == "adamw8bit"
         assert args.epochs == 4 and args.batch_size * args.grad_accum == 16
         assert args.limit_train is None and args.limit_val is None
         assert args.generation_limit == 256 and args.generation_subset_seed == 42
@@ -69,7 +70,7 @@ def test_native_lora_trains_only_adapters_with_shared_checkpoint_selection(tmp_p
 
         monkeypatch.setattr(CheckpointManager, "save", capture)
         out = tmp_path / "run"
-        common = ["--model", str(base), "--device", "cpu", "--precision", "fp32",
+        common = ["--model", str(base), "--device", "cpu", "--precision", "fp32", "--optim", "adamw",
                   "--batch-size", "1", "--grad-accum", "2", "--rank", "2", "--lora-alpha", "4"]
         report = main(common + ["--output-dir", str(out)])
         assert report["method"] == "lora" and report["quantization"] is None
