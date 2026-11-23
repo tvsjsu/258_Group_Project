@@ -34,7 +34,8 @@ def parse_args(argv=None, configure_parser=None):
     p.add_argument("--warmup-ratio", type=float, default=0.03)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--max-length", type=int, default=2048, help="Drop examples longer than this many tokens.")
-    p.add_argument("--optim", default="adamw", choices=["adamw", "adafactor"])
+    p.add_argument("--optim", default="adamw8bit", choices=["adamw8bit", "adamw", "adafactor"],
+                   help="Shared default: bitsandbytes 8-bit AdamW on CUDA. Use adamw for standard PyTorch AdamW.")
     p.add_argument("--precision", default="auto", choices=["auto", "fp32", "bf16-mixed", "bf16"],
                    help="auto = bf16-mixed on CUDA GPUs that support it, else fp32.")
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
