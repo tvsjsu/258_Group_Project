@@ -188,7 +188,8 @@ def source_hashes():
     root = Path(__file__).resolve().parents[1]
     return {
         name: hashlib.sha256((root / name).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
-        for name in ("data/data.py", "model/prompt.py", "train/finetune.py")
+        for name in ("data/data.py", "model/prompt.py", "model/model.py", "eval/metrics.py", "eval/eval.py",
+                     "train/finetune.py", "train/validation.py", "train/checkpointing.py")
     }
 
 
@@ -384,12 +385,12 @@ def parse_args(argv=None, configure_parser=None):
     p.add_argument("--model", default=MODEL_NAME, help="Hugging Face id or local path.")
     p.add_argument("--output-dir", default="checkpoints/full")
     p.add_argument("--limit-train", type=example_limit, default=None, help="Use the first N train examples, or 'all' (default).")
-    p.add_argument("--limit-val", type=example_limit, default=100, help="Validation examples for loss: N, 'all', or 0 to skip (default: 100).")
-    p.add_argument("--epochs", type=float, default=1.0)
+    p.add_argument("--limit-val", type=example_limit, default=None, help="Validation examples for loss AND generation: N, 'all' (default), or 0 to skip.")
+    p.add_argument("--epochs", type=float, default=4.0)
     p.add_argument("--max-steps", type=int, default=None, help="Stop after N optimizer steps (overrides --epochs).")
     p.add_argument("--batch-size", type=int, default=1, help="Micro-batch size per forward pass.")
-    p.add_argument("--grad-accum", type=int, default=8, help="Micro-batches per optimizer step.")
-    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--grad-accum", type=int, default=16, help="Micro-batches per optimizer step.")
+    p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--warmup-ratio", type=float, default=0.03)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -397,10 +398,20 @@ def parse_args(argv=None, configure_parser=None):
     p.add_argument("--optim", default="adamw", choices=["adamw", "adafactor"])
     p.add_argument("--precision", default="auto", choices=["auto", "fp32", "bf16-mixed", "bf16"],
                    help="auto = bf16-mixed on CUDA GPUs that support it, else fp32.")
-    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default=None)
     p.add_argument("--log-every", type=int, default=1)
-    p.add_argument("--eval-every", type=int, default=0, help="Validation loss every N steps (0 = only before/after).")
+    p.add_argument("--eval-every", type=int, default=0, help="Override epoch-based loss checks with every N optimizer steps (0 = automatic epoch cadence).")
+    p.add_argument("--val-checks-per-epoch", type=int, default=10)
+    p.add_argument("--generation-checks-per-epoch", type=int, default=2, help="0 disables generated validation and best-model selection.")
+    p.add_argument("--eval-batch-size", type=int, default=2, help="Independent teacher-forced validation micro-batch.")
+    p.add_argument("--generation-batch-size", type=int, default=1)
+    p.add_argument("--generation-max-new-tokens", type=int, default=512)
+    p.add_argument("--lr-scheduler", choices=["cosine", "linear"], default="cosine")
+    p.add_argument("--revision", default=None, help="Optional base model/tokenizer commit ID.")
+    p.add_argument("--save-steps", type=int, default=100, help="Resumable checkpoint interval; also save at epoch ends, generation checks and final step.")
+    p.add_argument("--resume-from-checkpoint", default=None)
+    p.add_argument("--reference-data", default=None)
     p.add_argument("--no-save", action="store_true", help="Skip writing the model checkpoint.")
     p.add_argument("--seed", type=int, default=42)
 
@@ -415,7 +426,7 @@ def parse_args(argv=None, configure_parser=None):
     if configure_parser is not None:
         configure_parser(p)
     args = p.parse_args(argv)
-    for name in ("batch_size", "grad_accum", "max_length"):
+    for name in ("batch_size", "grad_accum", "max_length", "eval_batch_size", "generation_batch_size", "generation_max_new_tokens", "save_steps"):
         if getattr(args, name) < 1:
             p.error(f"--{name.replace('_', '-')} must be at least 1")
     if args.max_steps is not None and args.max_steps < 1:
@@ -424,6 +435,10 @@ def parse_args(argv=None, configure_parser=None):
         p.error("--epochs must be positive and finite")
     if args.log_every < 1 or args.eval_every < 0:
         p.error("--log-every must be positive and --eval-every must be nonnegative")
+    if args.val_checks_per_epoch < 0 or args.generation_checks_per_epoch < 0:
+        p.error("Validation checks per epoch must be nonnegative")
+    if args.no_save and args.resume_from_checkpoint:
+        p.error("--resume-from-checkpoint requires saving")
     if not math.isfinite(args.lr) or args.lr <= 0:
         p.error("--lr must be positive and finite")
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
@@ -435,24 +450,37 @@ def parse_args(argv=None, configure_parser=None):
     return args
 
 
-def run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir, checkpoints=None):
+def run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir, checkpoints=None,
+                 generation_evaluator=None):
     """Train, persist step history, and measure training separately from validation."""
-    from transformers import get_linear_schedule_with_warmup
+    from transformers import get_scheduler
+    from train.validation import is_better, validation_due, write_history
 
     epoch_limits, total_steps = training_plan(
         len(train_loader), args.grad_accum, args.epochs, args.max_steps
     )
     print(f"Optimizer steps: {total_steps} (configured effective batch {args.batch_size * args.grad_accum})")
     optimizer = build_optimizer(args.optim, model, args.lr, args.weight_decay)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, int(total_steps * args.warmup_ratio), total_steps
+    warmup_steps = math.ceil(total_steps * args.warmup_ratio)
+    scheduler = get_scheduler(
+        args.lr_scheduler, optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
     resumed = checkpoints.restore(optimizer, scheduler) if checkpoints is not None else {}
     val_loss_before = resumed.get("val_loss_before")
     validation_before_seconds = resumed.get("validation_before_seconds", 0.0)
+    validation_history = list(resumed.get("validation_history", []))
     if not resumed and len(val_loader.dataset):
         val_loss_before, validation_before_seconds = timed_validation(model, val_loader, device, autocast_dtype)
         print(f"Validation loss before training: {val_loss_before:.4f}")
+        initial = {"step": 0, "epochs_completed": 0.0, "val_loss": val_loss_before}
+        if generation_evaluator is not None:
+            synchronize(device)
+            initial_started = time.perf_counter()
+            initial.update(generation_evaluator(0))
+            synchronize(device)
+            validation_before_seconds += time.perf_counter() - initial_started
+        validation_history.append(initial)
+    write_history(output_dir, validation_history)
 
     memory = MemoryTracker(device)
     history = list(resumed.get("history", []))
@@ -488,6 +516,10 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                 checkpoints.restore_random_state()
             window_loss = 0.0
             window_tokens = window_examples = micro_in_window = 0
+            window_padded_tokens = window_sequence_length = 0
+            previous_update_batch = skip_batches
+            synchronize(device)
+            window_started = time.perf_counter()
             for batch_index, batch in enumerate(islice(iterator, batches_this_epoch - skip_batches), start=skip_batches + 1):
                 batch = {key: value.to(device) for key, value in batch.items()}
                 n_tokens = int((batch["labels"][:, 1:] != IGNORE_INDEX).sum())
@@ -508,6 +540,8 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                 examples_seen += len(batch["input_ids"])
                 micro += 1
                 micro_in_window += 1
+                window_padded_tokens += batch["input_ids"].numel()
+                window_sequence_length = max(window_sequence_length, batch["input_ids"].shape[1])
                 if micro_in_window < args.grad_accum and batch_index < batches_this_epoch:
                     continue
 
@@ -521,6 +555,7 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                 optimizer.zero_grad(set_to_none=True)
                 memory.sample()
                 step += 1
+                synchronize(device)
                 record = {
                     "step": step,
                     "epochs_completed": examples_seen / len(train_loader.dataset),
@@ -529,12 +564,57 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                     "response_tokens": window_tokens,
                     "grad_norm": float(grad_norm),
                     "lr": learning_rate,
+                    "step_seconds": time.perf_counter() - window_started,
+                    "padded_tokens": window_padded_tokens,
+                    "max_sequence_length": window_sequence_length,
                 }
-                if args.eval_every and step % args.eval_every == 0 and len(val_loader.dataset):
+                if device.type == "cuda":
+                    stats = torch.cuda.memory_stats(device)
+                    free, _ = torch.cuda.mem_get_info(device)
+                    record.update({
+                        "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                        "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+                        "gpu_allocated_bytes_after_step": torch.cuda.memory_allocated(device),
+                        "gpu_reserved_bytes_after_step": torch.cuda.memory_reserved(device),
+                        "gpu_free_bytes_after_step": free,
+                        "cuda_allocation_retries_total": stats.get("num_alloc_retries", 0),
+                        "cuda_ooms_total": stats.get("num_ooms", 0),
+                    })
+                final = step >= total_steps
+                epoch_end = batch_index == len(train_loader)
+                generation_due = generation_evaluator is not None and (
+                    validation_due(previous_update_batch, batch_index, len(train_loader), args.generation_checks_per_epoch)
+                    or final
+                )
+                loss_due = len(val_loader.dataset) and (
+                    (step % args.eval_every == 0 if args.eval_every else validation_due(
+                        previous_update_batch, batch_index, len(train_loader), args.val_checks_per_epoch))
+                    or generation_due or final
+                )
+                candidate = None
+                if loss_due:
                     memory.sample()
                     record["val_loss"], seconds = timed_validation(model, val_loader, device, autocast_dtype)
                     periodic_validation_seconds += seconds
                     memory.restart_interval()
+                    validation_record = {"step": step, "epochs_completed": record["epochs_completed"],
+                                         "train_loss": record["train_loss"], "val_loss": record["val_loss"]}
+                    if generation_due:
+                        synchronize(device)
+                        generation_started = time.perf_counter()
+                        metrics = generation_evaluator(step)
+                        synchronize(device)
+                        periodic_validation_seconds += time.perf_counter() - generation_started
+                        validation_record.update(metrics)
+                        record.update({key: value for key, value in metrics.items() if key != "predictions_file"})
+                        candidate = {"step": step, "epochs_completed": record["epochs_completed"],
+                                     "complete_call_accuracy": metrics["complete_call_accuracy"], "val_loss": record["val_loss"]}
+                        best = checkpoints.best if checkpoints is not None else None
+                        if not is_better(candidate, best):
+                            candidate = None
+                        memory.restart_interval()
+                    validation_history.append(validation_record)
+                    write_history(output_dir, validation_history)
                 history.append(record)
                 history_stream.write(json.dumps(record, allow_nan=False) + "\n")
                 history_stream.flush()
@@ -543,10 +623,10 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                     extra = f" val_loss {record['val_loss']:.4f}" if "val_loss" in record else ""
                     print(f"[step {step}/{total_steps}] loss {record['train_loss']:.4f} "
                           f"grad_norm {record['grad_norm']:.2f} lr {learning_rate:.2e}{extra} "
-                          f"({elapsed:.0f}s training)", flush=True)
+                          f"({elapsed:.0f}s training; {record['step_seconds']:.2f}s/step; max_length {window_sequence_length})", flush=True)
                 window_loss = 0.0
                 window_tokens = window_examples = micro_in_window = 0
-                if checkpoints is not None and checkpoints.should_save(step, batch_index == batches_this_epoch, step >= total_steps):
+                if checkpoints is not None and (generation_due or checkpoints.should_save(step, epoch_end, final)):
                     synchronize(device)
                     memory.sample()
                     progress = {
@@ -555,6 +635,7 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                         "summed_loss": summed_loss, "history": list(history),
                         "epoch_index": epoch_index, "batch_index": batch_index,
                         "epoch_generator_state": epoch_generator_state,
+                        "validation_history": list(validation_history),
                         "val_loss_before": val_loss_before, "validation_before_seconds": validation_before_seconds,
                         "periodic_validation_seconds": resumed.get("periodic_validation_seconds", 0.0) + periodic_validation_seconds,
                         "train_seconds": previous_train_seconds + time.perf_counter() - started - periodic_validation_seconds - checkpoint_seconds,
@@ -562,8 +643,12 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                         "peak_memory_bytes": max(resumed.get("peak_memory_bytes") or 0, memory.peak_bytes() or 0),
                         "peak_reserved_memory_bytes": max(resumed.get("peak_reserved_memory_bytes") or 0, memory.reserved_bytes() or 0),
                     }
-                    checkpoint_seconds += checkpoints.save(model, optimizer, scheduler, progress)
-                    memory.restart_interval()
+                    checkpoint_seconds += checkpoints.save(model, optimizer, scheduler, progress, best_candidate=candidate)
+                memory.restart_interval()
+                previous_update_batch = batch_index
+                window_padded_tokens = window_sequence_length = 0
+                synchronize(device)
+                window_started = time.perf_counter()
                 if step >= total_steps:
                     break
             if step >= total_steps:
@@ -582,7 +667,7 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
 
     val_loss_after, validation_after_seconds = None, 0.0
     if len(val_loader.dataset):
-        val_loss_after, validation_after_seconds = timed_validation(model, val_loader, device, autocast_dtype)
+        val_loss_after = validation_history[-1]["val_loss"]
     return {
         "optimizer_steps": step,
         "micro_batches": micro,
@@ -613,6 +698,16 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
             "after_training": validation_after_seconds,
         },
         "history": history,
+        "validation_history": validation_history,
+        "best_checkpoint": checkpoints.best if checkpoints is not None else None,
+        "selected_model_path": "best" if checkpoints is not None and checkpoints.best else None,
+        "last_model_path": ".",
+        "lr_scheduler": args.lr_scheduler,
+        "warmup_steps": warmup_steps,
+        "optimizer_settings": {key: list(value) if isinstance(value, tuple) else value
+                               for key, value in optimizer.defaults.items()
+                               if key in ("lr", "betas", "eps", "weight_decay")},
+        "early_stopping": False,
     }
 
 
@@ -627,7 +722,17 @@ def main(argv=None, splits=None, *, args=None, model_loader=None, checkpoints=No
     device = pick_device(args.device)
     (weight_dtype, autocast_dtype), precision = resolve_precision(args.precision, device)
     output_dir = Path(args.output_dir)
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.resume_from_checkpoint:
+        raise FileExistsError("Output directory is not empty. Choose a new run directory, or resume its latest checkpoint.")
     output_dir.mkdir(parents=True, exist_ok=True)
+    if checkpoints is None and not args.no_save:
+        from train.checkpointing import AdapterCheckpoints
+        checkpoints = AdapterCheckpoints(args)  # save_pretrained supports both full models and adapters.
+    if checkpoints is not None and checkpoints.state:
+        saved_step = checkpoints.state["progress"]["step"]
+        if any(int(path.name.removeprefix("checkpoint-")) > saved_step for path in output_dir.glob("checkpoint-*")
+               if path.name.removeprefix("checkpoint-").isdigit()):
+            raise ValueError("Later checkpoints exist. Resume the latest one, or use a new output directory to branch.")
     environment = environment_info(device)
     code_hashes = source_hashes()
 
@@ -689,14 +794,26 @@ def main(argv=None, splits=None, *, args=None, model_loader=None, checkpoints=No
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(train_features, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate, generator=generator)
-    val_loader = DataLoader(val_features, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate)
+    val_loader = DataLoader(val_features, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+    retained_validation_ids = set(validation_data["retained_ids"])
+    generation_examples = [row for row in val_examples if row["id"] in retained_validation_ids]
+    if args.generation_checks_per_epoch and generation_examples:
+        from eval.metrics import validate_examples
+        validate_examples(generation_examples)
 
     # Model -----------------------------------------------------------------
     synchronize(device)
     load_started = time.perf_counter()
-    model = (model_loader(args, device, autocast_dtype or weight_dtype) if model_loader is not None
-             else AutoModelForCausalLM.from_pretrained(args.model, dtype=weight_dtype).to(device))
+    if model_loader is not None:
+        model = model_loader(args, device, autocast_dtype or weight_dtype)
+    else:
+        source = args.resume_from_checkpoint or args.model
+        options = {"dtype": weight_dtype}
+        if not args.resume_from_checkpoint:
+            options["revision"] = args.revision
+        model = AutoModelForCausalLM.from_pretrained(source, **options).to(device)
+        if checkpoints is not None and checkpoints.state:
+            model.config._commit_hash = checkpoints.state["base_revision"]
     synchronize(device)
     model_load_seconds = time.perf_counter() - load_started
     model.config.use_cache = False
@@ -713,7 +830,15 @@ def main(argv=None, splits=None, *, args=None, model_loader=None, checkpoints=No
 
     if checkpoints is not None:
         checkpoints.bind_model(model)
-    training_metrics = run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir, checkpoints)
+    generation_evaluator = None
+    if args.generation_checks_per_epoch and generation_examples:
+        from train.validation import generation_metrics
+
+        def generation_evaluator(step):
+            return generation_metrics(model, tokenizer, generation_examples, args, device, autocast_dtype, output_dir, step)
+
+    training_metrics = run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir, checkpoints,
+                                    generation_evaluator=generation_evaluator)
 
     # Save the checkpoint before measuring its model/tokenizer artifact sizes.
     sizes = {"model_weights_bytes": None, "checkpoint_bytes": None}
@@ -756,6 +881,22 @@ def main(argv=None, splits=None, *, args=None, model_loader=None, checkpoints=No
         "run_wall_seconds": time.perf_counter() - run_started,
         "data_splits_file": "data_splits.json",
         "training_history_file": "training_history.jsonl",
+        "validation_history_file": "validation_history.jsonl",
+        "validation_history_csv": "validation_history.csv",
+        "validation_protocol": {
+            "metric_protocol": "strict-json-v1", "split": "validation",
+            "examples": len(generation_examples), "uses_retained_after_length_filter": True,
+            "val_checks_per_epoch": args.val_checks_per_epoch, "eval_every_override": args.eval_every,
+            "generation_checks_per_epoch": args.generation_checks_per_epoch,
+            "generation_batch_size": args.generation_batch_size,
+            "max_new_tokens": args.generation_max_new_tokens, "do_sample": False, "num_beams": 1,
+            "generation_weights": "in-memory training weights; QLoRA retains NF4 base and FP32 adapters",
+            "precision": precision, "warmup_rounding": "ceil",
+            "selection_includes_initial_baseline": False,
+        },
+        "periodic_checkpoints_storage_bytes": checkpoints.storage_bytes() if checkpoints is not None else 0,
+        "checkpoint_storage_scope": "logical file bytes; hard links may reduce occupied disk space",
+        "memory_measurement_note": "Training tensor peaks exclude validation operations; reserved memory includes cached allocations retained from earlier phases. CUDA counters do not measure Windows shared-memory residency.",
         **training_metrics,
         **sizes,
     }

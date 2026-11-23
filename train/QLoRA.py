@@ -17,15 +17,11 @@ from train.checkpointing import AdapterCheckpoints
 
 def configure_parser(parser):
     parser.description = "Train QLoRA with the baseline data/prompt and comparable report artifacts."
-    parser.set_defaults(output_dir="checkpoints/qlora", lr=2e-4, gradient_checkpointing=True)
+    parser.set_defaults(output_dir="checkpoints/qlora", lr=1e-4, batch_size=2, grad_accum=8, gradient_checkpointing=True)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--target-modules", nargs="+", default=["all-linear"])
-    parser.add_argument("--revision", default=None, help="Optional base model/tokenizer commit ID.")
-    parser.add_argument("--save-steps", type=int, default=100, help="Checkpoint every N optimizer steps, plus epoch ends and final step.")
-    parser.add_argument("--resume-from-checkpoint", default=None, help="Path to a checkpoint-N folder, not the final adapter folder.")
-    parser.add_argument("--reference-data", default=None, help="Optional full fine-tuning data_splits.json; stop if split/filtering identities differ.")
 
 
 def parse_args(argv=None):

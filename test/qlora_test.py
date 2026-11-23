@@ -2,6 +2,7 @@
 
 import copy
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -51,8 +52,11 @@ def test_qlora_defaults_and_invalid_options():
     assert args.rank == 16 and args.lora_alpha == 32
     assert args.max_length == 2048 and args.grad_accum == 8
     assert args.gradient_checkpointing is True
+    assert args.batch_size == 2 and args.grad_accum == 8
+    assert args.epochs == 4 and args.limit_val is None and args.lr == 1e-4
+    assert args.lr_scheduler == "cosine"
     assert args.output_dir == "checkpoints/qlora"
-    with pytest.raises(ValueError):
+    with pytest.raises(SystemExit):
         parse_args(["--save-steps", "0"])
     with pytest.raises(ValueError):
         parse_args(["--no-save"])
@@ -94,6 +98,8 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
         "code_sha256": {"test": "same-code"},
     }
 
+    captured = tmp_path / "captured"
+
     def run(folder, resume=None):
         folder.mkdir()
         options = ["--device", "cpu", "--precision", "fp32", "--epochs", "2",
@@ -103,6 +109,16 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
             options += ["--resume-from-checkpoint", str(resume)]
         args = parse_args(options)
         manager = AdapterCheckpoints(args)
+        original_save = manager.save
+
+        def save(*save_args, **save_kwargs):
+            result = original_save(*save_args, **save_kwargs)
+            checkpoint = folder / f"checkpoint-{checkpoint_step}"
+            if checkpoint.exists() and not captured.exists():
+                shutil.copytree(checkpoint, captured)
+            return result
+
+        manager.save = save
         manager.prepare(manifest, args, TinyTokenizer())
         torch.manual_seed(23)
         base = copy.deepcopy(original)
@@ -118,11 +134,13 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
         return model, report, manager
 
     continuous, metrics, _ = run(tmp_path / "continuous")
-    checkpoint = tmp_path / "continuous" / f"checkpoint-{checkpoint_step}"
+    checkpoint = captured
     assert (checkpoint / "training_state.pt").is_file()
     assert (checkpoint / "adapter_model.safetensors").is_file()
     resumed, resumed_metrics, manager = run(tmp_path / "resumed", checkpoint)
-    assert resumed_metrics["history"] == metrics["history"]
+    def deterministic_history(report):
+        return [{key: value for key, value in row.items() if key != "step_seconds"} for row in report["history"]]
+    assert deterministic_history(resumed_metrics) == deterministic_history(metrics)
     assert resumed_metrics["examples_seen"] == metrics["examples_seen"] == 8
     assert resumed_metrics["epochs_completed"] == metrics["epochs_completed"] == 2
     for key, value in continuous.state_dict().items():

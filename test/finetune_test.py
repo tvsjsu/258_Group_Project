@@ -111,6 +111,7 @@ def training_args(output_dir):
         "--device", "cpu", "--precision", "fp32", "--batch-size", "1",
         "--grad-accum", "3", "--epochs", "1", "--limit-val", "all",
         "--max-length", "1024", "--output-dir", str(output_dir),
+        "--generation-checks-per-epoch", "0", "--no-gradient-checkpointing",
     ]
 
 
@@ -200,6 +201,7 @@ def test_shared_baseline_splits_and_report_artifacts(tmp_path, splits, model_loa
     assert report["validation_seconds"]["during_training"] > 0
     assert report["train_seconds"] == pytest.approx(
         report["training_loop_seconds"] - report["validation_seconds"]["during_training"]
+        - report["periodic_checkpoint_seconds"]
     )
     assert manifest["settings"]["split_seed"] == 42
     assert manifest["raw_splits"]["test_seen"]["ids"] == ["test_seen-0"]
@@ -224,6 +226,6 @@ def test_no_save_still_writes_data_and_training_metrics(tmp_path, splits, model_
 
 def test_all_validation_option():
     assert parse_args(["--limit-val", "all"]).limit_val is None
-    assert parse_args([]).limit_val == 100
+    assert parse_args([]).limit_val is None
     with pytest.raises(SystemExit):
         parse_args(["--limit-val", "-1"])

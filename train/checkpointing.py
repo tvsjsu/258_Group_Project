@@ -1,6 +1,7 @@
-"""Adapter checkpoints at optimizer boundaries, with deterministic data-position recovery."""
+"""Full-model or adapter checkpoints, best-model snapshots, and deterministic recovery."""
 
 import json
+import os
 from pathlib import Path
 import random
 import shutil
@@ -31,8 +32,10 @@ class AdapterCheckpoints:
         self.output_dir = Path(args.output_dir)
         self.resume = Path(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
         self.state = None
+        self.best = None
         if self.resume:
             self.state = torch.load(self.resume / "training_state.pt", map_location="cpu", weights_only=True)
+            self.best = self.state.get("best")
 
     def prepare(self, manifest, args, tokenizer):
         self.tokenizer = tokenizer
@@ -76,6 +79,15 @@ class AdapterCheckpoints:
 
     def restore(self, optimizer, scheduler):
         if self.state:
+            predictions = self.resume / "validation_predictions"
+            if predictions.is_dir():
+                self._replace_directory(predictions, self.output_dir / "validation_predictions")
+            if self.best:
+                snapshot = self.resume / "best_model"
+                if not snapshot.is_dir():
+                    raise ValueError("Checkpoint is missing its best-model snapshot")
+                self._replace_directory(snapshot, self.output_dir / "best")
+                self._write_best()
             optimizer.load_state_dict(self.state["optimizer"])
             scheduler.load_state_dict(self.state["scheduler"])
             progress = dict(self.state["progress"])
@@ -91,7 +103,40 @@ class AdapterCheckpoints:
     def should_save(self, step, epoch_end, final):
         return step % self.args.save_steps == 0 or epoch_end or final
 
-    def save(self, model, optimizer, scheduler, progress):
+    @staticmethod
+    def _link_or_copy(source, destination):
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+
+    def _replace_directory(self, source, destination):
+        temporary = self.output_dir / ".best-recovery"
+        shutil.rmtree(temporary, ignore_errors=True)
+        shutil.copytree(source, temporary, copy_function=self._link_or_copy)
+        shutil.rmtree(destination, ignore_errors=True)
+        temporary.rename(destination)
+
+    def _write_best(self):
+        path = self.output_dir / "best_checkpoint.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({**self.best, "model_path": "best",
+                                        "selection_rule": "validation complete-call accuracy; tie: lower validation loss; tie: earlier step"},
+                                       indent=2, allow_nan=False), encoding="utf-8")
+        temporary.replace(path)
+
+    def prune(self):
+        checkpoints = sorted((path for path in self.output_dir.glob("checkpoint-*")
+                              if path.is_dir() and path.name.removeprefix("checkpoint-").isdigit()),
+                             key=lambda path: int(path.name.removeprefix("checkpoint-")))
+        keep = {path.name for path in checkpoints[-2:]}
+        if self.best:
+            keep.add(f"checkpoint-{self.best['step']}")
+        for path in checkpoints:
+            if path.name not in keep:
+                shutil.rmtree(path)
+
+    def save(self, model, optimizer, scheduler, progress, best_candidate=None):
         started = time.perf_counter()
         destination = self.output_dir / f"checkpoint-{progress['step']}"
         if destination.exists():
@@ -101,6 +146,19 @@ class AdapterCheckpoints:
         try:
             model.save_pretrained(temporary, safe_serialization=True)
             self.tokenizer.save_pretrained(temporary)
+            next_best = best_candidate or self.best
+            if next_best:
+                snapshot = temporary / "best_model"
+                if best_candidate:
+                    snapshot.mkdir()
+                    for path in temporary.iterdir():
+                        if path.is_file():
+                            self._link_or_copy(path, snapshot / path.name)
+                else:
+                    shutil.copytree(self.output_dir / "best", snapshot, copy_function=self._link_or_copy)
+            predictions = self.output_dir / "validation_predictions"
+            if predictions.is_dir():
+                shutil.copytree(predictions, temporary / "validation_predictions", copy_function=self._link_or_copy)
             torch.save({
                 "contract": self.contract,
                 "base_revision": self.base_revision,
@@ -109,6 +167,7 @@ class AdapterCheckpoints:
                 "progress": progress,
                 "rng": saved_rng,
                 "sessions": self.sessions(),
+                "best": next_best,
             }, temporary / "training_state.pt")
             elapsed = time.perf_counter() - started
             (temporary / "checkpoint_info.json").write_text(json.dumps({
@@ -116,9 +175,24 @@ class AdapterCheckpoints:
                 "checkpoint_save_seconds": elapsed,
             }, indent=2), encoding="utf-8")
             temporary.rename(destination)
-            (self.output_dir / "latest_checkpoint.json").write_text(json.dumps({
+            if best_candidate:
+                self.best = best_candidate
+                self._replace_directory(destination / "best_model", self.output_dir / "best")
+                self._write_best()
+            latest = self.output_dir / "latest_checkpoint.json"
+            latest_temporary = latest.with_suffix(".tmp")
+            latest_temporary.write_text(json.dumps({
                 "path": destination.name, "step": progress["step"],
             }, indent=2), encoding="utf-8")
+            latest_temporary.replace(latest)
+            self.prune()
+            # Recovery accounting includes export/retention work, not just serialization.
+            info_path = destination / "checkpoint_info.json"
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            info["checkpoint_save_seconds"] = time.perf_counter() - started
+            info_temporary = info_path.with_suffix(".tmp")
+            info_temporary.write_text(json.dumps(info, indent=2), encoding="utf-8")
+            info_temporary.replace(info_path)
             return time.perf_counter() - started
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)
@@ -128,4 +202,6 @@ class AdapterCheckpoints:
             restore_rng(saved_rng)
 
     def storage_bytes(self):
-        return sum(path.stat().st_size for path in self.output_dir.glob("checkpoint-*/*") if path.is_file())
+        # Logical file sizes; filesystem hard links can reduce actual occupied space.
+        return sum(path.stat().st_size for directory in self.output_dir.glob("checkpoint-*")
+                   for path in directory.rglob("*") if path.is_file())
