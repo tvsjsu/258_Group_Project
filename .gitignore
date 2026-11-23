@@ -222,5 +222,8 @@ __marimo__/
 # Visual Studio Code
 .vscode/settings.json
 
+# Training outputs
+checkpoints/
+
 # Eval outputs
 results/

@@ -1,3 +1,5 @@
+"""Check dataset parsing, split invariants, and loader behavior."""
+
 import json
 
 import pytest
@@ -7,15 +9,18 @@ from data.data import FunctionCallingDataset
 
 @pytest.fixture(scope="module")
 def raw_dataset():
+    """Load the source dataset for data integration checks."""
     return FunctionCallingDataset._load_data()
 
 
 @pytest.fixture(scope="module")
 def examples(raw_dataset):
+    """Decode the source rows into structured function-calling examples."""
     return FunctionCallingDataset._preprocess(raw_dataset)
 
 
 def test_load_data(raw_dataset):
+    """Verify load data."""
     assert len(raw_dataset) > 0
     assert {
         "id", "query", "tools", "answers"
@@ -23,6 +28,7 @@ def test_load_data(raw_dataset):
 
 
 def test_preprocess(raw_dataset, examples):
+    """Verify preprocess."""
     wrapped = FunctionCallingDataset(examples)
 
     assert len(wrapped) == len(raw_dataset)
@@ -38,6 +44,7 @@ def test_preprocess(raw_dataset, examples):
 
 
 def test_split_examples(examples):
+    """Verify split examples."""
     groups = FunctionCallingDataset._split_examples(examples)
 
     assert groups == FunctionCallingDataset._split_examples(examples)
@@ -77,19 +84,21 @@ def test_split_examples(examples):
     assert names["validation"] <= names["train"]
 
 def test_loader_preserves_examples(examples):
+    """Verify loader preserves examples."""
     expected = examples[:3]
     dataset = FunctionCallingDataset(expected)
 
     batches = list(dataset.make_loader(batch_size=2))
 
-    # Keep the final batch even though it contains only one example.
+
     assert [len(batch) for batch in batches] == [2, 1]
 
-    # Preserve order and all nested example contents.
+
     actual = [example for batch in batches for example in batch]
     assert actual == expected
 
 def test_length_grouping_preserves_examples(examples, monkeypatch):
+    """Verify length grouping preserves examples."""
     expected = examples[:3]
     dataset = FunctionCallingDataset(expected)
 

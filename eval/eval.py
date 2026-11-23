@@ -1,3 +1,5 @@
+"""Evaluate full models and adapters with the shared function-calling protocol."""
+
 import argparse
 import json
 from contextlib import nullcontext
@@ -20,6 +22,8 @@ def parse_args(argv=None):
         help="Hugging Face model ID or local full-model checkpoint directory (default: deepseek-ai/deepseek-coder-1.3b-instruct).",
     )
     parser.add_argument("--limit", type=int, default=None, help="Maximum examples per split (default: all).")
+    parser.add_argument("--adapter", default=None, help="PEFT adapter directory; infer its base model when --model is omitted.")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Evaluate with an NF4/double-quantized CUDA base; default uses the requested inference dtype.")
     parser.add_argument("--split", default="test_seen", choices=["test_seen", "test_unseen", "validation", "both"])
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -55,13 +59,24 @@ def prepare_splits(split, limit=None):
     return selected
 
 
-def load_model(model_name=None, *, device=None, dtype="auto"):
-    """Load the requested model and return it with its resolved name."""
-    # Model imports stay here so metric tests do not load PyTorch/model weights.
+def load_model(model_name=None, *, device=None, dtype="auto", adapter=None, load_in_4bit=False):
+    """Lazily load the requested model or adapter and return its resolved base-model name."""
+
     from model.model import MODEL_NAME, FunctionCallingModel
 
+    if adapter is not None:
+        from peft import PeftConfig
+        base_name = PeftConfig.from_pretrained(adapter).base_model_name_or_path
+        if model_name is not None and model_name != base_name:
+            raise ValueError("--model must match the base model recorded in the adapter config; omit it to infer the base")
+        model_name = base_name
     model_name = model_name if model_name is not None else MODEL_NAME
-    model = FunctionCallingModel(model_name=model_name, device=device, dtype=dtype)
+    options = {}
+    if adapter is not None:
+        options["adapter_name"] = adapter
+    if load_in_4bit:
+        options["load_in_4bit"] = True
+    model = FunctionCallingModel(model_name=model_name, device=device, dtype=dtype, **options)
     return model, model_name
 
 
@@ -119,6 +134,8 @@ def evaluate_model(model, model_name, splits, *, batch_size=1, max_new_tokens=51
             "batch_size": batch_size,
             "max_new_tokens": max_new_tokens,
             "group_by_length": False,
+            "quantization": getattr(model, "quantization_settings", None),
+            "adapter_parameter_dtypes": getattr(model, "adapter_parameter_dtypes", []),
         },
         "splits": {},
     }
@@ -153,12 +170,16 @@ def save_report(report, output_path):
 
 
 def main(argv=None):
+    """Run schema preflight, generate predictions, and save aggregate evaluation metrics."""
     args = parse_args(argv)
     splits = prepare_splits(args.split, args.limit)
     if args.check_data_only:
         return
 
-    model, model_name = load_model(args.model, device=args.device, dtype=args.dtype)
+    model, model_name = load_model(
+        args.model, device=args.device, dtype=args.dtype,
+        adapter=args.adapter, load_in_4bit=args.load_in_4bit,
+    )
     output_path = None if args.no_output else args.output
     report = evaluate_model(
         model, model_name, splits,
@@ -166,6 +187,8 @@ def main(argv=None):
         max_new_tokens=args.max_new_tokens,
         output_path=output_path,
     )
+    report["settings"]["adapter"] = args.adapter
+    report["settings"]["base_quantization"] = "nf4-double-quantized" if args.load_in_4bit else "unquantized"
     if output_path is not None:
         save_report(report, output_path)
     return report

@@ -1,3 +1,5 @@
+"""Parse function calls, validate schemas, and calculate the five evaluation metrics."""
+
 import ast
 import json
 import math
@@ -12,10 +14,12 @@ from scipy.optimize import linear_sum_assignment
 
 
 def _reject_constant(value):
+    """Reject non-finite constants while parsing strict JSON."""
     raise ValueError(f"Non-finite JSON number: {value}")
 
 
 def _unique_object(pairs):
+    """Construct a JSON object while rejecting duplicate keys."""
     result = {}
     for key, value in pairs:
         if key in result:
@@ -25,6 +29,7 @@ def _unique_object(pairs):
 
 
 def _json_value(value):
+    """Check recursively that a value can be represented as finite JSON data."""
     if value is None or type(value) in (str, bool, int):
         return True
     if type(value) is float:
@@ -37,6 +42,7 @@ def _json_value(value):
 
 
 def _valid_calls(calls):
+    """Check the required call-array structure, function names, and argument objects."""
     return isinstance(calls, list) and all(
         isinstance(call, dict)
         and set(call) == {"name", "arguments"}
@@ -120,7 +126,7 @@ def _strip_type_metadata(hint):
     return hint
 
 def _type_schema(hint):
-    """Translate common xLAM/Python type labels without executing type strings."""
+    """Translate Python-style parameter types; encode sets as unique arrays and callables as strings."""
     if isinstance(hint, list):
         return {"anyOf": [_type_schema(t) for t in hint]}
     if not isinstance(hint, str):
@@ -128,12 +134,13 @@ def _type_schema(hint):
     hint = _strip_type_metadata(hint)
 
     def convert(node):
+        """Convert a supported type-expression node into a JSON schema fragment."""
         if isinstance(node, ast.Name):
             name = node.id.lower()
             if name == "any":
                 return {}
             if name == "set":
-                # Evaluator convention: sets use JSON arrays without duplicates.
+
                 return {"type": "array", "uniqueItems": True}
             if name in _TYPES:
                 return {"type": _TYPES[name]}
@@ -162,7 +169,7 @@ def _type_schema(hint):
                     and args[0].value is Ellipsis
                 )
             ):
-                # Dataset convention: callable arguments are serialized strings.
+
                 return {"type": "string"}
             if name in ("list", "array") and len(args) == 1:
                 return {"type": "array", "items": convert(args[0])}
@@ -195,6 +202,7 @@ def _type_schema(hint):
 
 
 def _normalize_spec(spec):
+    """Normalize parameter types and nested schemas without evaluating type strings."""
     if isinstance(spec, bool):
         return spec
     if not isinstance(spec, dict):
@@ -222,6 +230,7 @@ def _normalize_spec(spec):
 
 
 def _reject_references(value):
+    """Reject referenced schemas that the evaluator cannot resolve explicitly."""
     if isinstance(value, dict):
         for key, item in value.items():
             if key in ("$ref", "$dynamicRef", "$recursiveRef") and isinstance(item, str):
@@ -234,6 +243,7 @@ def _reject_references(value):
 
 @lru_cache(maxsize=8192)
 def _validator(parameters_json):
+    """Compile and cache the validator for a serialized tool-parameter schema."""
     parameters = json.loads(parameters_json)
     _reject_references(parameters)
     if not isinstance(parameters, dict):
@@ -284,6 +294,7 @@ def validate_examples(examples):
     issues = {}
 
     def record(exc, example, tool=None):
+        """Count repeated schema issues and retain one representative example."""
         message = str(exc.__cause__ or exc)
         issue = issues.setdefault(message, {
             "error": message,
@@ -319,7 +330,7 @@ def validate_examples(examples):
 
 
 def _argument_counts(predicted, expected):
-    """Pair calls by name; maximize correct values, then shared argument names."""
+    """Match calls by name and count correct slots while penalizing missing and extra arguments."""
     correct = shared = 0
     ref_total = sum(len(c["arguments"]) for c in expected)
     pred_total = sum(len(c["arguments"]) for c in predicted)
@@ -340,11 +351,12 @@ def _argument_counts(predicted, expected):
             good, overlap = pairs[i][j]
             correct += good
             shared += overlap
-    # Reference slots plus predicted slots without a matched reference name.
+    # Count reference slots plus predicted slots not paired with a reference slot.
     return correct, ref_total + pred_total - shared
 
 
 def score(predicted, expected, tools):
+    """Score one predicted call array against its reference and available function schemas."""
     if not _valid_calls(expected):
         raise ValueError("Invalid reference call structure")
     validators = compile_tools(tools)
@@ -370,10 +382,12 @@ def score(predicted, expected, tools):
 
 
 def summarize(scores):
+    """Aggregate example-level rates and micro-averaged argument accuracy."""
     count = len(scores)
     correct = sum(s["argument_correct"] for s in scores)
     total = sum(s["argument_total"] for s in scores)
     def rate(key):
+        """Compute the example-level rate for one Boolean scoring field."""
         return sum(s[key] for s in scores) / count if count else None
     return {
         "examples": count,
@@ -388,6 +402,7 @@ def summarize(scores):
 
 
 def print_summary(label, scores):
+    """Print the five aggregate function-calling metrics for one labeled result set."""
     metrics = summarize(scores)
     print(f"\nSplit: {label}  Examples: {metrics['examples']}")
     for title, key in (

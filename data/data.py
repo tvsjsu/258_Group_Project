@@ -1,3 +1,5 @@
+"""Load function-calling examples and create deterministic seen/unseen tool splits."""
+
 import json
 import random
 
@@ -11,12 +13,15 @@ class FunctionCallingDataset(Dataset):
     DATASET_NAME = "Salesforce/xlam-function-calling-60k"
 
     def __init__(self, examples):
+        """Store the examples belonging to one prepared split."""
         self.examples = examples
 
     def __len__(self):
+        """Return the number of examples in the split."""
         return len(self.examples)
 
     def __getitem__(self, index):
+        """Return one example or a slice of examples in source order."""
         return self.examples[index]
 
     @classmethod
@@ -37,10 +42,12 @@ class FunctionCallingDataset(Dataset):
 
     @classmethod
     def _load_data(cls):
+        """Load the source training partition from Hugging Face."""
         return load_dataset(cls.DATASET_NAME, split="train")
 
     @staticmethod
     def _preprocess(rows):
+        """Decode serialized tools and answers while preserving source example IDs."""
         examples = []
 
         for batch in rows.iter(batch_size=1000, drop_last_batch=False):
@@ -61,10 +68,12 @@ class FunctionCallingDataset(Dataset):
 
     @staticmethod
     def _tool_names(example):
+        """Collect the available function names in one example."""
         return {tool["name"] for tool in example["tools"]}
 
     @classmethod
     def _split_examples(cls, examples, seed=42, unseen_fraction=0.2):
+        """Partition tool identities, exclude mixed-tool examples, and repair seen-tool training coverage."""
         rng = random.Random(seed)
 
         names = sorted({
@@ -88,7 +97,6 @@ class FunctionCallingDataset(Dataset):
             elif names.isdisjoint(unseen_names):
                 seen.append(example)
 
-            # Exclude examples that mix seen and unseen tools.
 
         rng.shuffle(seen)
 
@@ -102,7 +110,7 @@ class FunctionCallingDataset(Dataset):
             "test_unseen": unseen,
         }
 
-        # Every seen evaluation tool must also appear in training.
+
         train_names = {
             name
             for example in splits["train"]
@@ -133,6 +141,7 @@ class FunctionCallingDataset(Dataset):
         tokenizer=None,
         group_by_length=False,
     ):
+        """Build a loader that preserves nested examples and optionally groups prompt lengths."""
         dataset = self
 
         if group_by_length:
