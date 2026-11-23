@@ -123,7 +123,7 @@ def model_loaders(monkeypatch):
 def training_args(output_dir):
     """Build a small CPU training configuration for an isolated output directory."""
     return [
-        "--device", "cpu", "--precision", "fp32", "--batch-size", "1",
+        "--device", "cpu", "--precision", "fp32", "--optim", "adamw", "--batch-size", "1",
         "--grad-accum", "3", "--epochs", "1", "--limit-val", "all",
         "--max-length", "1024", "--output-dir", str(output_dir),
         "--generation-checks-per-epoch", "0", "--no-gradient-checkpointing",
