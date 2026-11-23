@@ -147,7 +147,7 @@ def describe_splits(splits):
 def environment_info(device):
     """Record hardware and software so measurements can be interpreted later."""
     packages = {}
-    for name in ("torch", "transformers", "datasets"):
+    for name in ("torch", "transformers", "datasets", "peft", "bitsandbytes", "accelerate"):
         try:
             packages[name] = version(name)
         except PackageNotFoundError:
@@ -196,7 +196,7 @@ def checkpoint_sizes(output_dir, tokenizer_files):
     """Count model/tokenizer artifacts without counting logs or split records."""
     output_dir = Path(output_dir)
     weights, indexes = [], []
-    for filename in ("model.safetensors", "pytorch_model.bin"):
+    for filename in ("adapter_model.safetensors", "model.safetensors", "pytorch_model.bin"):
         path = output_dir / filename
         index = output_dir / (filename + ".index.json")
         if path.is_file():
@@ -208,7 +208,7 @@ def checkpoint_sizes(output_dir, tokenizer_files):
             indexes = [index]
             break
     files = set(weights + indexes + [Path(name) for name in tokenizer_files])
-    files.update(output_dir / name for name in ("config.json", "generation_config.json"))
+    files.update(output_dir / name for name in ("config.json", "generation_config.json", "adapter_config.json"))
     return {
         "model_weights_bytes": sum(path.stat().st_size for path in weights),
         "checkpoint_bytes": sum(path.stat().st_size for path in files if path.is_file()),
@@ -378,7 +378,7 @@ def timed_validation(model, loader, device, autocast_dtype):
     return loss, time.perf_counter() - started
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, configure_parser=None):
     from model.model import MODEL_NAME
     p = argparse.ArgumentParser(description="Full fine-tuning on the xLAM train split.")
     p.add_argument("--model", default=MODEL_NAME, help="Hugging Face id or local path.")
@@ -397,7 +397,7 @@ def parse_args(argv=None):
     p.add_argument("--optim", default="adamw", choices=["adamw", "adafactor"])
     p.add_argument("--precision", default="auto", choices=["auto", "fp32", "bf16-mixed", "bf16"],
                    help="auto = bf16-mixed on CUDA GPUs that support it, else fp32.")
-    p.add_argument("--gradient-checkpointing", action="store_true")
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--device", default=None)
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--eval-every", type=int, default=0, help="Validation loss every N steps (0 = only before/after).")
@@ -412,6 +412,8 @@ def parse_args(argv=None):
     #   --log-every 1 \
     #   --output-dir checkpoints/full_sanity
 
+    if configure_parser is not None:
+        configure_parser(p)
     args = p.parse_args(argv)
     for name in ("batch_size", "grad_accum", "max_length"):
         if getattr(args, name) < 1:
@@ -433,7 +435,7 @@ def parse_args(argv=None):
     return args
 
 
-def run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir):
+def run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir, checkpoints=None):
     """Train, persist step history, and measure training separately from validation."""
     from transformers import get_linear_schedule_with_warmup
 
@@ -445,23 +447,48 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(total_steps * args.warmup_ratio), total_steps
     )
-    val_loss_before, validation_before_seconds = None, 0.0
-    if len(val_loader.dataset):
+    resumed = checkpoints.restore(optimizer, scheduler) if checkpoints is not None else {}
+    val_loss_before = resumed.get("val_loss_before")
+    validation_before_seconds = resumed.get("validation_before_seconds", 0.0)
+    if not resumed and len(val_loader.dataset):
         val_loss_before, validation_before_seconds = timed_validation(model, val_loader, device, autocast_dtype)
         print(f"Validation loss before training: {val_loss_before:.4f}")
 
     memory = MemoryTracker(device)
-    history = []
-    step = micro = tokens_seen = response_tokens_seen = examples_seen = 0
-    summed_loss = periodic_validation_seconds = 0.0
+    history = list(resumed.get("history", []))
+    step = resumed.get("step", 0)
+    micro = resumed.get("micro", 0)
+    tokens_seen = resumed.get("tokens_seen", 0)
+    response_tokens_seen = resumed.get("response_tokens_seen", 0)
+    examples_seen = resumed.get("examples_seen", 0)
+    summed_loss = resumed.get("summed_loss", 0.0)
+    periodic_validation_seconds = checkpoint_seconds = 0.0
+    previous_train_seconds = resumed.get("train_seconds", 0.0)
+    checkpoint_seconds_total = resumed.get("checkpoint_seconds", 0.0)
     optimizer.zero_grad(set_to_none=True)
     synchronize(device)
     started = time.perf_counter()
     with (output_dir / "training_history.jsonl").open("w", encoding="utf-8") as history_stream:
-        for batches_this_epoch in epoch_limits:
+        for record in history:
+            history_stream.write(json.dumps(record, allow_nan=False) + "\n")
+        for epoch_index, batches_this_epoch in enumerate(epoch_limits):
+            if step >= total_steps:
+                break
+            if resumed and epoch_index < resumed["epoch_index"]:
+                continue
+            skip_batches = 0
+            if resumed and epoch_index == resumed["epoch_index"]:
+                train_loader.generator.set_state(resumed["epoch_generator_state"])
+                skip_batches = resumed["batch_index"]
+            epoch_generator_state = train_loader.generator.get_state().clone() if train_loader.generator is not None else None
+            iterator = iter(train_loader)
+            for _ in islice(iterator, skip_batches):
+                pass
+            if resumed and epoch_index == resumed["epoch_index"]:
+                checkpoints.restore_random_state()
             window_loss = 0.0
             window_tokens = window_examples = micro_in_window = 0
-            for batch_index, batch in enumerate(islice(train_loader, batches_this_epoch), start=1):
+            for batch_index, batch in enumerate(islice(iterator, batches_this_epoch - skip_batches), start=skip_batches + 1):
                 batch = {key: value.to(device) for key, value in batch.items()}
                 n_tokens = int((batch["labels"][:, 1:] != IGNORE_INDEX).sum())
                 with autocast(device, autocast_dtype):
@@ -512,23 +539,46 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
                 history_stream.write(json.dumps(record, allow_nan=False) + "\n")
                 history_stream.flush()
                 if step % args.log_every == 0 or step == total_steps:
-                    elapsed = time.perf_counter() - started - periodic_validation_seconds
+                    elapsed = previous_train_seconds + time.perf_counter() - started - periodic_validation_seconds - checkpoint_seconds
                     extra = f" val_loss {record['val_loss']:.4f}" if "val_loss" in record else ""
                     print(f"[step {step}/{total_steps}] loss {record['train_loss']:.4f} "
                           f"grad_norm {record['grad_norm']:.2f} lr {learning_rate:.2e}{extra} "
                           f"({elapsed:.0f}s training)", flush=True)
                 window_loss = 0.0
                 window_tokens = window_examples = micro_in_window = 0
+                if checkpoints is not None and checkpoints.should_save(step, batch_index == batches_this_epoch, step >= total_steps):
+                    synchronize(device)
+                    memory.sample()
+                    progress = {
+                        "step": step, "micro": micro, "tokens_seen": tokens_seen,
+                        "response_tokens_seen": response_tokens_seen, "examples_seen": examples_seen,
+                        "summed_loss": summed_loss, "history": list(history),
+                        "epoch_index": epoch_index, "batch_index": batch_index,
+                        "epoch_generator_state": epoch_generator_state,
+                        "val_loss_before": val_loss_before, "validation_before_seconds": validation_before_seconds,
+                        "periodic_validation_seconds": resumed.get("periodic_validation_seconds", 0.0) + periodic_validation_seconds,
+                        "train_seconds": previous_train_seconds + time.perf_counter() - started - periodic_validation_seconds - checkpoint_seconds,
+                        "checkpoint_seconds": checkpoint_seconds_total + checkpoint_seconds,
+                        "peak_memory_bytes": max(resumed.get("peak_memory_bytes") or 0, memory.peak_bytes() or 0),
+                        "peak_reserved_memory_bytes": max(resumed.get("peak_reserved_memory_bytes") or 0, memory.reserved_bytes() or 0),
+                    }
+                    checkpoint_seconds += checkpoints.save(model, optimizer, scheduler, progress)
+                    memory.restart_interval()
                 if step >= total_steps:
                     break
             if step >= total_steps:
                 break
     synchronize(device)
     loop_seconds = time.perf_counter() - started
-    train_seconds = loop_seconds - periodic_validation_seconds
+    train_seconds = previous_train_seconds + loop_seconds - periodic_validation_seconds - checkpoint_seconds
     memory.sample()
     peak_memory = memory.peak_bytes()
     peak_reserved = memory.reserved_bytes()
+    if resumed:
+        if peak_memory is not None:
+            peak_memory = max(peak_memory, resumed.get("peak_memory_bytes") or 0)
+        if peak_reserved is not None:
+            peak_reserved = max(peak_reserved, resumed.get("peak_reserved_memory_bytes") or 0)
 
     val_loss_after, validation_after_seconds = None, 0.0
     if len(val_loader.dataset):
@@ -543,7 +593,8 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
         "train_loss": summed_loss / response_tokens_seen,
         "train_loss_last_step": history[-1]["train_loss"],
         "train_seconds": train_seconds,
-        "training_loop_seconds": loop_seconds,
+        "training_loop_seconds": train_seconds + periodic_validation_seconds + resumed.get("periodic_validation_seconds", 0.0) + checkpoint_seconds_total + checkpoint_seconds,
+        "periodic_checkpoint_seconds": checkpoint_seconds_total + checkpoint_seconds,
         "seconds_per_step": train_seconds / step,
         "examples_per_second": examples_seen / max(train_seconds, 1e-9),
         "tokens_per_second": tokens_seen / max(train_seconds, 1e-9),
@@ -558,19 +609,19 @@ def run_training(model, train_loader, val_loader, args, device, autocast_dtype, 
         "val_loss_after": val_loss_after,
         "validation_seconds": {
             "before_training": validation_before_seconds,
-            "during_training": periodic_validation_seconds,
+            "during_training": periodic_validation_seconds + resumed.get("periodic_validation_seconds", 0.0),
             "after_training": validation_after_seconds,
         },
         "history": history,
     }
 
 
-def main(argv=None, splits=None):
+def main(argv=None, splits=None, *, args=None, model_loader=None, checkpoints=None, method="full", extra_report=None):
     """Run full fine-tuning and save the data, model, and report artifacts."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     run_started = time.perf_counter()
-    args = parse_args(argv)
+    args = args if args is not None else parse_args(argv)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
@@ -590,7 +641,10 @@ def main(argv=None, splits=None):
         splits = FunctionCallingDataset.load_splits(seed=DATA_SEED, unseen_fraction=UNSEEN_FRACTION)
     train_examples = list(splits["train"])[:args.limit_train]
     val_examples = list(splits["validation"])[:args.limit_val]
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer_revision_to_load = getattr(args, "revision", None)
+    if checkpoints is not None and checkpoints.state:
+        tokenizer_revision_to_load = checkpoints.state["base_revision"] or tokenizer_revision_to_load
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=tokenizer_revision_to_load)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     train_features, train_data = prepare_split(tokenizer, train_examples, args.max_length)
@@ -621,6 +675,13 @@ def main(argv=None, splits=None):
         ).hexdigest(),
         "code_sha256": code_hashes,
     }
+    if method != "full":
+        root = Path(__file__).resolve().parents[1]
+        for name in ("train/QLoRA.py", "train/checkpointing.py"):
+            code_hashes[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+    if checkpoints is not None:
+        checkpoints.prepare(data_manifest, args, tokenizer)
+        checkpoints.record_environment(environment)
     write_json(output_dir / "data_splits.json", data_manifest)
     preprocessing_seconds = time.perf_counter() - preprocessing_started
 
@@ -634,20 +695,25 @@ def main(argv=None, splits=None):
     # Model -----------------------------------------------------------------
     synchronize(device)
     load_started = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=weight_dtype).to(device)
+    model = (model_loader(args, device, autocast_dtype or weight_dtype) if model_loader is not None
+             else AutoModelForCausalLM.from_pretrained(args.model, dtype=weight_dtype).to(device))
     synchronize(device)
     model_load_seconds = time.perf_counter() - load_started
     model.config.use_cache = False
-    if args.gradient_checkpointing:
+    if args.gradient_checkpointing and model_loader is None:
         model.gradient_checkpointing_enable()
     model.train()
     total_params = sum(parameter.numel() for parameter in model.parameters())
     trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    if hasattr(model, "get_nb_trainable_parameters"):
+        trainable_params, total_params = model.get_nb_trainable_parameters()
     print(f"Device: {device}, precision: {precision}, optimizer: {args.optim}")
     print(f"Parameters: {trainable_params:,} trainable / {total_params:,} total "
           f"({100 * trainable_params / total_params:.1f}%)")
 
-    training_metrics = run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir)
+    if checkpoints is not None:
+        checkpoints.bind_model(model)
+    training_metrics = run_training(model, train_loader, val_loader, args, device, autocast_dtype, output_dir, checkpoints)
 
     # Save the checkpoint before measuring its model/tokenizer artifact sizes.
     sizes = {"model_weights_bytes": None, "checkpoint_bytes": None}
@@ -659,7 +725,7 @@ def main(argv=None, splits=None):
         sizes = checkpoint_sizes(output_dir, tokenizer_files)
     checkpoint_save_seconds = time.perf_counter() - save_started
     report = {
-        "method": "full",
+        "method": method,
         "model": args.model,
         "model_revision": getattr(model.config, "_commit_hash", None),
         "tokenizer_revision": tokenizer_revision,
@@ -693,10 +759,12 @@ def main(argv=None, splits=None):
         **training_metrics,
         **sizes,
     }
+    if extra_report is not None:
+        report.update(extra_report(model, report))
     write_json(output_dir / "train_metrics.json", report)
 
     gib = 1024 ** 3
-    print("\n=== Full fine-tuning summary ===")
+    print(f"\n=== {method} fine-tuning summary ===")
     print(f"Optimizer steps:      {report['optimizer_steps']}")
     print(f"Epochs completed:     {report['epochs_completed']:.3f}")
     print(f"Training time:        {report['train_seconds']:.1f}s ({report['seconds_per_step']:.2f}s/step)")
