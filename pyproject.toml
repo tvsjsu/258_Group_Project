@@ -8,17 +8,13 @@ dependencies = [
     "datasets>=2.20,<5",
     "jsonschema>=4.18,<5",
     "scipy>=1.10,<2",
-]
-
-[dependency-groups]
-dev = ["pytest>=8,<10"]
-
-[project.optional-dependencies]
-qlora = [
     "peft>=0.17,<0.19",
     "accelerate>=1.10,<2",
     "bitsandbytes>=0.48,<0.50",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

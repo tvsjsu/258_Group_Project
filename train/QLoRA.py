@@ -1,43 +1,25 @@
-"""QLoRA on the shared baseline splits; CUDA, NF4, double quantization, PEFT LoRA.
+"""QLoRA model construction and entry point for the shared trainer.
 
-    uv sync --extra qlora
-    uv run python -m train.QLoRA --limit-val all --output-dir checkpoints/qlora
-
-Training and report generation reuse train.finetune. Adapter checkpoints retain
-optimizer/scheduler, RNG, history, and sampler position for interrupted runs.
+    uv run --extra qlora python -m train.QLoRA --output-dir checkpoints/qlora_final
 """
-
-from pathlib import Path
-
-import torch
-
-from train import finetune
-from train.checkpointing import AdapterCheckpoints
+from train.config import add_adapter_arguments, parse_args as parse_config, validate_adapter_args
+from train.reporting import adapter_report
+from train.trainer import run_experiment
+from train.runtime import require_cuda
 
 
 def configure_parser(parser):
     parser.description = "Train QLoRA with the baseline data/prompt and comparable report artifacts."
     parser.set_defaults(output_dir="checkpoints/qlora", lr=1e-4, batch_size=2, grad_accum=8, gradient_checkpointing=True)
-    parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--target-modules", nargs="+", default=["all-linear"])
+    add_adapter_arguments(parser)
 
 
 def parse_args(argv=None):
-    args = finetune.parse_args(argv, configure_parser)
-    if args.rank < 1 or args.lora_alpha < 1 or args.save_steps < 1:
-        raise ValueError("--rank, --lora-alpha, and --save-steps must be positive")
-    if not 0 <= args.lora_dropout < 1:
-        raise ValueError("--lora-dropout must be in [0, 1)")
-    if "all-linear" in args.target_modules and args.target_modules != ["all-linear"]:
-        raise ValueError("Use 'all-linear' alone or supply individual target module names")
-    if args.no_save:
-        raise ValueError("QLoRA always saves its final adapter and resumable checkpoints; omit --no-save")
-    return args
+    return validate_adapter_args(parse_config(argv, configure_parser))
 
 
-def build_model(args, device, compute_dtype):
+def build_model(args, context):
+    device, compute_dtype = context.device, context.compute_dtype
     from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
@@ -77,50 +59,20 @@ def build_model(args, device, compute_dtype):
     return model
 
 
+def describe_model(model, args, report, context):
+    return {
+        **adapter_report(model, args, report),
+        "weight_dtype": "mixed: frozen 4-bit NF4 base; higher-precision adapters and unquantized modules",
+        "quantization": {"bits": 4, "type": "nf4", "double_quantization": True,
+                         "compute_dtype": str(context.compute_dtype)},
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
-    device = finetune.pick_device(args.device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("This QLoRA training configuration requires an NVIDIA CUDA GPU. Install dependencies with: uv sync --extra qlora")
-    device = torch.device("cuda", device.index if device.index is not None else torch.cuda.current_device())
-    args.device = str(device)
-    torch.cuda.set_device(device)
-    if args.precision.startswith("bf16") and not torch.cuda.is_bf16_supported():
-        raise ValueError("This GPU does not support BF16; use --precision fp32")
-    output_dir = Path(args.output_dir)
-    if output_dir.exists() and any(output_dir.iterdir()) and not args.resume_from_checkpoint:
-        raise FileExistsError("Output directory is not empty. Use a new run directory or --resume-from-checkpoint.")
-    checkpoints = AdapterCheckpoints(args)
-    if checkpoints.state:
-        saved_step = checkpoints.state["progress"]["step"]
-        if any(path.name.removeprefix("checkpoint-").isdigit() and int(path.name.removeprefix("checkpoint-")) > saved_step
-               for path in output_dir.glob("checkpoint-*")):
-            raise FileExistsError("Later checkpoints exist in this output directory. Resume the latest checkpoint, or branch into a new output directory.")
-
-    def additional_report(model, report):
-        dtype = finetune.resolve_precision(args.precision, device)[0][1]
-        compute = dtype or finetune.resolve_precision(args.precision, device)[0][0]
-        return {
-            "weight_dtype": "mixed: frozen 4-bit NF4 base; higher-precision adapters and unquantized modules",
-            "quantization": {"bits": 4, "type": "nf4", "double_quantization": True, "compute_dtype": str(compute)},
-            "lora": {"rank": args.rank, "alpha": args.lora_alpha, "dropout": args.lora_dropout, "target_modules": args.target_modules},
-            "adapter_parameter_dtypes": sorted({str(parameter.dtype) for parameter in model.parameters() if parameter.requires_grad}),
-            "trainable_parameter_names": [name for name, parameter in model.named_parameters() if parameter.requires_grad],
-            "checkpoint_artifact": "adapter and tokenizer; base model required separately",
-            "adapter_weights_bytes": report["model_weights_bytes"],
-            "base_model_required": args.model,
-            "loaded_model_memory_footprint_bytes": model.get_memory_footprint(),
-            "periodic_checkpoints_storage_bytes": checkpoints.storage_bytes(),
-            "resume_from_checkpoint": args.resume_from_checkpoint,
-            "training_sessions": checkpoints.sessions(),
-            "run_wall_time_scope": "current invocation only",
-            "resume_accounting": "training totals include recovered checkpoint progress plus this invocation; discarded work since the last checkpoint is excluded",
-        }
-
-    return finetune.main(
-        args=args, model_loader=build_model, checkpoints=checkpoints,
-        method="qlora", extra_report=additional_report,
-    )
+    args.device = str(require_cuda(args.device, args.precision))
+    return run_experiment(args, build_model, method="qlora", describe_model=describe_model,
+                          method_source=__file__)
 
 
 if __name__ == "__main__":

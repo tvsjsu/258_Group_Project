@@ -11,16 +11,15 @@ import torch
 from safetensors.torch import save_file
 import transformers
 
-from train.finetune import (
+from train.preparation import (
     IGNORE_INDEX,
     describe_splits,
-    main,
     make_collator,
-    normalize_gradients,
-    parse_args,
     prepare_split,
-    training_plan,
 )
+from train.finetune import main
+from train.config import parse_args
+from train.trainer import normalize_gradients, training_plan
 
 
 class TinyTokenizer:

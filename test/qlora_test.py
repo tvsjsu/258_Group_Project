@@ -12,9 +12,11 @@ import torch
 from torch.utils.data import DataLoader
 import transformers
 
-from train import finetune
+from train import trainer
+from train.preparation import make_collator
+from train.runtime import ModelContext
 from train.QLoRA import build_model, parse_args
-from train.checkpointing import AdapterCheckpoints
+from train.checkpointing import CheckpointManager
 from finetune_test import TinyTokenizer
 
 
@@ -55,6 +57,9 @@ def test_qlora_defaults_and_invalid_options():
     assert args.batch_size == 2 and args.grad_accum == 8
     assert args.epochs == 4 and args.limit_val is None and args.lr == 1e-4
     assert args.lr_scheduler == "cosine"
+    assert args.generation_limit == 256 and args.generation_subset_seed == 42
+    assert args.generation_checks_per_epoch == 1 and args.val_checks_per_epoch == 10
+    assert args.generation_batch_size == 4
     assert args.output_dir == "checkpoints/qlora"
     with pytest.raises(SystemExit):
         parse_args(["--save-steps", "0"])
@@ -69,7 +74,7 @@ def test_nf4_loading_and_only_adapter_parameters_train(peft_library, monkeypatch
     loader = Mock(return_value=base)
     monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", loader)
     args = parse_args(["--no-gradient-checkpointing", "--rank", "2", "--lora-alpha", "4"])
-    model = build_model(args, torch.device("cuda:0"), torch.bfloat16)
+    model = build_model(args, ModelContext(torch.device("cuda:0"), torch.float32, torch.bfloat16))
     config = loader.call_args.kwargs["quantization_config"]
     assert config.load_in_4bit and config.bnb_4bit_use_double_quant
     assert config.bnb_4bit_quant_type == "nf4"
@@ -108,7 +113,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
         if resume:
             options += ["--resume-from-checkpoint", str(resume)]
         args = parse_args(options)
-        manager = AdapterCheckpoints(args)
+        manager = CheckpointManager(args)
         original_save = manager.save
 
         def save(*save_args, **save_kwargs):
@@ -128,9 +133,9 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
         model.train()
         manager.bind_model(model)
         loader = DataLoader(features, batch_size=1, shuffle=True,
-                            generator=torch.Generator().manual_seed(42), collate_fn=finetune.make_collator(0))
-        validation = DataLoader(features[:2], batch_size=1, collate_fn=finetune.make_collator(0))
-        report = finetune.run_training(model, loader, validation, args, torch.device("cpu"), None, folder, manager)
+                            generator=torch.Generator().manual_seed(42), collate_fn=make_collator(0))
+        validation = DataLoader(features[:2], batch_size=1, collate_fn=make_collator(0))
+        report = trainer.run_training(model, loader, validation, args, torch.device("cpu"), None, folder, manager)
         return model, report, manager
 
     continuous, metrics, _ = run(tmp_path / "continuous")
@@ -200,7 +205,7 @@ def test_reference_data_mismatch_is_rejected(tmp_path):
     reference = tmp_path / "data_splits.json"
     reference.write_text(json.dumps(manifest))
     args = parse_args(["--reference-data", str(reference)])
-    manager = AdapterCheckpoints(args)
+    manager = CheckpointManager(args)
     manager.prepare(manifest, args, TinyTokenizer())
     changed = copy.deepcopy(manifest)
     changed["used_splits"]["train"]["retained_ids"] = [2, 1]

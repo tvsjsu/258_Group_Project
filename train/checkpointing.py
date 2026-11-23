@@ -26,7 +26,7 @@ def restore_rng(state):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-class AdapterCheckpoints:
+class CheckpointManager:
     def __init__(self, args):
         self.args = args
         self.output_dir = Path(args.output_dir)
@@ -44,6 +44,7 @@ class AdapterCheckpoints:
             "settings": {key: value for key, value in vars(args).items() if key not in ignored},
             "raw_splits": manifest["raw_splits"],
             "used_splits": manifest["used_splits"],
+            "generation_validation": manifest.get("generation_validation"),
             "chat_template_sha256": manifest["chat_template_sha256"],
             "tokenizer_revision": manifest["tokenizer_revision"],
             "code_sha256": manifest["code_sha256"],
@@ -55,6 +56,8 @@ class AdapterCheckpoints:
             for key in ("raw_splits", "used_splits", "chat_template_sha256", "tokenizer_revision"):
                 if manifest[key] != reference[key]:
                     raise ValueError(f"Training data differs from reference data_splits.json: {key}")
+            if manifest.get("generation_validation") != reference.get("generation_validation"):
+                raise ValueError("Generation validation subset differs from reference data_splits.json")
             if manifest.get("tokenizer") != reference.get("tokenizer"):
                 raise ValueError("Tokenizer differs from reference data_splits.json")
 
@@ -205,3 +208,17 @@ class AdapterCheckpoints:
         # Logical file sizes; filesystem hard links can reduce actual occupied space.
         return sum(path.stat().st_size for directory in self.output_dir.glob("checkpoint-*")
                    for path in directory.rglob("*") if path.is_file())
+
+
+def prepare_output_directory(args, state=None):
+    """Validate output/resume position once, before any run artifacts are written."""
+    output_dir = Path(args.output_dir)
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.resume_from_checkpoint:
+        raise FileExistsError("Output directory is not empty. Choose a new run directory, or resume its latest checkpoint.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if state:
+        saved_step = state["progress"]["step"]
+        if any(int(path.name.removeprefix("checkpoint-")) > saved_step for path in output_dir.glob("checkpoint-*")
+               if path.name.removeprefix("checkpoint-").isdigit()):
+            raise ValueError("Later checkpoints exist. Resume the latest one, or use a new output directory to branch.")
+    return output_dir

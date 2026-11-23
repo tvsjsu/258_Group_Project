@@ -1,12 +1,37 @@
 """Validation cadence and generation scoring on the in-memory training model."""
 
-import csv
+import gc
 import json
+import time
 from contextlib import nullcontext
 
 import torch
 
 from train.checkpointing import restore_rng, rng_state
+from train.preparation import IGNORE_INDEX
+from train.runtime import autocast, synchronize
+
+
+def release_validation_cache(device):
+    """Release unused allocations at a phase boundary, never live model tensors."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        with torch.cuda.device(device):
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
+def generation_oom_message(step, batch_size):
+    smaller = max(1, batch_size // 2)
+    if batch_size == 1:
+        advice = "Generation already uses batch size 1; inspect live GPU memory and other GPU processes."
+    else:
+        advice = f"Restart with --generation-batch-size {smaller} or smaller; keep the chosen value fixed across comparison runs."
+    return (
+        f"Out of memory during validation generation at optimizer step {step}, generation batch size {batch_size}. "
+        "The training-prepared model and its memory footprint differ from a separately loaded inference model. "
+        f"{advice} Training --batch-size and --grad-accum are separate settings. "
+        "No automatic batch-size change was made."
+    )
 
 
 def validation_due(previous_batch, current_batch, batches_per_epoch, checks):
@@ -29,19 +54,6 @@ def is_better(candidate, best):
     )
 
 
-def write_history(output_dir, records):
-    """Rewrite from recovered state so resumed curves have no duplicate future rows."""
-    with (output_dir / "validation_history.jsonl").open("w", encoding="utf-8") as stream:
-        for record in records:
-            stream.write(json.dumps(record, allow_nan=False) + "\n")
-    if records:
-        fields = list(dict.fromkeys(key for row in records for key in row))
-        with (output_dir / "validation_history.csv").open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(records)
-
-
 @torch.no_grad()
 def generation_metrics(model, tokenizer, examples, args, device, autocast_dtype, output_dir, step):
     """Same prompt, strict scoring, greedy decoding and EOS handling as eval/eval.py.
@@ -59,6 +71,7 @@ def generation_metrics(model, tokenizer, examples, args, device, autocast_dtype,
     wrapper.model, wrapper.tokenizer = model, tokenizer
     model.eval()
     tokenizer.padding_side = "left"
+    release_validation_cache(device)
     scores = []
     directory = output_dir / "validation_predictions"
     directory.mkdir(exist_ok=True)
@@ -86,12 +99,52 @@ def generation_metrics(model, tokenizer, examples, args, device, autocast_dtype,
                         "id": row["id"], "expected": row["answers"],
                         "predicted": predicted, "raw_output": output, **result,
                     }, ensure_ascii=False, allow_nan=False) + "\n")
-                if offset == 0 or offset + len(batch) >= len(examples) or (offset // args.generation_batch_size + 1) % 100 == 0:
-                    print(f"[validation generation step {step}] {offset + len(batch)}/{len(examples)}", flush=True)
+                print(f"[validation generation step {step}] {offset + len(batch)}/{len(examples)}", flush=True)
         temporary.replace(destination)
-        return {**summarize(scores), "predictions_file": str(destination.relative_to(output_dir))}
+        return {**summarize(scores), "predictions_file": str(destination.relative_to(output_dir)),
+                "generation_batch_size": args.generation_batch_size}
+    except torch.OutOfMemoryError as error:
+        diagnosis = {
+            "phase": "validation_generation", "optimizer_step": step,
+            "generation_batch_size": args.generation_batch_size,
+            "max_new_tokens": args.generation_max_new_tokens,
+            "successfully_scored_examples": len(scores),
+            "batch_size_automatically_changed": False,
+            "embedding_dtype": str(model.get_input_embeddings().weight.dtype)
+            if hasattr(model, "get_input_embeddings") else None,
+            "original_error": str(error),
+            "message": generation_oom_message(step, args.generation_batch_size),
+        }
+        (output_dir / "validation_oom.json").write_text(
+            json.dumps(diagnosis, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        raise RuntimeError(diagnosis["message"]) from error
     finally:
         temporary.unlink(missing_ok=True)
         tokenizer.padding_side = padding
         model.train(was_training)
         restore_rng(saved_rng)
+        release_validation_cache(device)
+
+
+@torch.no_grad()
+def evaluate_loss(model, loader, device, autocast_dtype):
+    """Token-weighted mean loss over the response tokens."""
+    model.eval()
+    total_loss, total_tokens = 0.0, 0
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        tokens = int((batch["labels"][:, 1:] != IGNORE_INDEX).sum())
+        with autocast(device, autocast_dtype):
+            loss = model(**batch).loss
+        total_loss += float(loss) * tokens
+        total_tokens += tokens
+    model.train()
+    return total_loss / max(total_tokens, 1)
+
+
+def timed_validation(model, loader, device, autocast_dtype):
+    synchronize(device)
+    started = time.perf_counter()
+    loss = evaluate_loss(model, loader, device, autocast_dtype)
+    synchronize(device)
+    return loss, time.perf_counter() - started
