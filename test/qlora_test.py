@@ -1,10 +1,8 @@
-"""Real CPU PEFT/checkpoint tests; NF4 CUDA loading is checked with a loader mock."""
+"""Check QLoRA configuration and adapter recovery with CPU models and loader mocks."""
 
 import copy
 import json
 import shutil
-from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -22,11 +20,13 @@ from finetune_test import TinyTokenizer
 
 @pytest.fixture
 def peft_library():
+    """Provide PEFT when installed or skip adapter-dependent checks."""
     return pytest.importorskip("peft")
 
 
 @pytest.fixture(autouse=True)
 def one_thread():
+    """Temporarily limit CPU execution to one thread for local model checks."""
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
     yield
@@ -34,6 +34,7 @@ def one_thread():
 
 
 def tiny_base():
+    """Create a local tiny Llama model without downloading weights."""
     config = transformers.LlamaConfig(
         vocab_size=16, hidden_size=8, intermediate_size=16, num_hidden_layers=1,
         num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=2048,
@@ -43,6 +44,7 @@ def tiny_base():
 
 
 def adapter(base, peft):
+    """Attach small LoRA adapters to a local base model."""
     return peft.get_peft_model(base, peft.LoraConfig(
         task_type="CAUSAL_LM", r=2, lora_alpha=4, lora_dropout=0.2,
         target_modules=["q_proj", "v_proj"],
@@ -50,6 +52,7 @@ def adapter(base, peft):
 
 
 def test_qlora_defaults_and_invalid_options():
+    """Verify QLoRA defaults and invalid options."""
     args = parse_args([])
     assert args.rank == 16 and args.lora_alpha == 32
     assert args.max_length == 2048 and args.grad_accum == 8
@@ -68,9 +71,10 @@ def test_qlora_defaults_and_invalid_options():
 
 
 def test_nf4_loading_and_only_adapter_parameters_train(peft_library, monkeypatch):
+    """Check NF4 loader options and adapter-only training using a mocked model loader."""
     pytest.importorskip("bitsandbytes")
     base = tiny_base()
-    base.is_loaded_in_4bit = True  # The loader is mocked: this is not a CUDA quantization test.
+    base.is_loaded_in_4bit = True
     loader = Mock(return_value=base)
     monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", loader)
     args = parse_args(["--no-gradient-checkpointing", "--rank", "2", "--lora-alpha", "4"])
@@ -86,6 +90,7 @@ def test_nf4_loading_and_only_adapter_parameters_train(peft_library, monkeypatch
 
 @pytest.mark.parametrize("checkpoint_step", [1, 2])
 def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoint_step):
+    """Verify resume matches uninterrupted training."""
     torch.manual_seed(17)
     original = tiny_base()
     original.save_pretrained(tmp_path / "base")
@@ -106,6 +111,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
     captured = tmp_path / "captured"
 
     def run(folder, resume=None):
+        """Execute a small training job with optional checkpoint recovery."""
         folder.mkdir()
         options = ["--device", "cpu", "--precision", "fp32", "--epochs", "2",
                    "--grad-accum", "3", "--save-steps", "1", "--eval-every", "1",
@@ -117,6 +123,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
         original_save = manager.save
 
         def save(*save_args, **save_kwargs):
+            """Save a checkpoint and preserve the requested recovery point for comparison."""
             result = original_save(*save_args, **save_kwargs)
             checkpoint = folder / f"checkpoint-{checkpoint_step}"
             if checkpoint.exists() and not captured.exists():
@@ -144,6 +151,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
     assert (checkpoint / "adapter_model.safetensors").is_file()
     resumed, resumed_metrics, manager = run(tmp_path / "resumed", checkpoint)
     def deterministic_history(report):
+        """Exclude elapsed times when comparing training histories."""
         return [{key: value for key, value in row.items() if key != "step_seconds"} for row in report["history"]]
     assert deterministic_history(resumed_metrics) == deterministic_history(metrics)
     assert resumed_metrics["examples_seen"] == metrics["examples_seen"] == 8
@@ -157,6 +165,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, peft_library, checkpoin
 
 
 def test_saved_adapter_can_be_loaded_by_shared_evaluator(tmp_path, peft_library, monkeypatch):
+    """Verify saved adapter can be loaded by shared evaluator."""
     from tokenizers import Tokenizer, models, pre_tokenizers
     from eval.eval import load_model
 
@@ -197,6 +206,7 @@ def test_saved_adapter_can_be_loaded_by_shared_evaluator(tmp_path, peft_library,
 
 
 def test_reference_data_mismatch_is_rejected(tmp_path):
+    """Verify reference data mismatch is rejected."""
     manifest = {
         "raw_splits": {"train": {"ids": [1, 2], "sha256": "content"}},
         "used_splits": {"train": {"retained_ids": [1, 2]}},

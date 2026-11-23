@@ -1,3 +1,5 @@
+"""Check strict call scoring and evaluator behavior with controlled examples."""
+
 import itertools
 import contextlib
 import io
@@ -21,6 +23,7 @@ from eval.metrics import (
 
 
 def call(name="add", **arguments):
+    """Construct a function-call object with the requested name and arguments."""
     return {"name": name, "arguments": arguments}
 
 
@@ -37,9 +40,11 @@ EXPECTED = [call(a=2, b=3)]
 
 class ParsingTests(unittest.TestCase):
     def test_strict_json_and_whitespace(self):
+        """Accept a strict call array with surrounding whitespace."""
         self.assertEqual(parse_calls(" \n" + json.dumps(EXPECTED) + "\n"), EXPECTED)
 
     def test_no_markdown_or_explanations(self):
+        """Reject call outputs surrounded by Markdown or explanatory text."""
         for text in (
             "```json\n" + json.dumps(EXPECTED) + "\n```",
             "Here are the calls: " + json.dumps(EXPECTED),
@@ -48,12 +53,14 @@ class ParsingTests(unittest.TestCase):
             self.assertIsNone(parse_calls(text))
 
     def test_envelope_and_types(self):
+        """Verify envelope and types."""
         for value in ({"name": "add", "arguments": {}}, [{"name": "add"}],
                       [{"name": 3, "arguments": {}}],
                       [{"name": "add", "arguments": {}, "extra": 1}]):
             self.assertIsNone(parse_calls(json.dumps(value)))
 
     def test_duplicate_keys_and_nonfinite_values(self):
+        """Verify duplicate keys and nonfinite values."""
         for text in (
             '[{"name":"add","arguments":{"a":1,"a":2}}]',
             '[{"name":"add","arguments":{"a":NaN}}]',
@@ -65,12 +72,14 @@ class ParsingTests(unittest.TestCase):
 
 class MetricTests(unittest.TestCase):
     def test_perfect(self):
+        """Award full credit to an exact function call."""
         result = score(EXPECTED, EXPECTED, TOOLS)
         self.assertTrue(all(result[k] for k in (
             "valid", "name_match", "schema_compliant", "exact_match")))
         self.assertEqual((result["argument_correct"], result["argument_total"]), (2, 2))
 
     def test_partial_values_independent_of_schema(self):
+        """Score argument values independently from schema compliance."""
         result = score([call(a=2, b=9)], EXPECTED, TOOLS)
         self.assertTrue(result["name_match"])
         self.assertTrue(result["schema_compliant"])
@@ -78,39 +87,46 @@ class MetricTests(unittest.TestCase):
         self.assertEqual((result["argument_correct"], result["argument_total"]), (1, 2))
 
     def test_missing_required_argument(self):
+        """Verify missing required argument."""
         result = score([call(a=2)], EXPECTED, TOOLS)
         self.assertFalse(result["schema_compliant"])
         self.assertEqual((result["argument_correct"], result["argument_total"]), (1, 2))
 
     def test_extra_arguments_are_penalized(self):
+        """Verify extra arguments are penalized."""
         result = score([call(a=2, b=3, extra=5)], EXPECTED, TOOLS)
         self.assertFalse(result["schema_compliant"])
         self.assertFalse(result["exact_match"])
         self.assertEqual((result["argument_correct"], result["argument_total"]), (2, 3))
 
     def test_wrong_function_gets_no_argument_credit(self):
+        """Verify wrong function gets no argument credit."""
         result = score([call("other", a=2, b=3)], EXPECTED, TOOLS)
         self.assertFalse(result["name_match"])
         self.assertFalse(result["schema_compliant"])
         self.assertEqual((result["argument_correct"], result["argument_total"]), (0, 4))
 
     def test_optional_parameter(self):
+        """Verify optional parameter."""
         result = score([call(a=2, b=3, label="ok")], EXPECTED, TOOLS)
         self.assertTrue(result["schema_compliant"])
         self.assertFalse(result["exact_match"])
         self.assertEqual(result["argument_total"], 3)
 
     def test_booleans_are_not_numbers(self):
+        """Verify booleans are not numbers."""
         result = score([call(a=True, b=3)], EXPECTED, TOOLS)
         self.assertFalse(result["schema_compliant"])
         self.assertEqual(result["argument_correct"], 1)
 
     def test_equivalent_numeric_representations(self):
+        """Verify equivalent numeric representations."""
         result = score([call(a=2.0, b=3.0)], EXPECTED, TOOLS)
         self.assertTrue(result["schema_compliant"])
         self.assertTrue(result["exact_match"])
 
     def test_repeated_calls_match_one_to_one_and_ignore_order(self):
+        """Verify repeated calls match one to one and ignore order."""
         expected = [call(a=1, b=2), call(a=3, b=4)]
         result = score(list(reversed(expected)), expected, TOOLS)
         self.assertTrue(result["exact_match"])
@@ -122,18 +138,21 @@ class MetricTests(unittest.TestCase):
         self.assertEqual((result["argument_correct"], result["argument_total"]), (4, 6))
 
     def test_nested_object_order_and_array_order(self):
+        """Verify nested object order and array order."""
         tools = [{"name": "f", "parameters": {"x": {"type": "dict", "required": True}}}]
         ref = [call("f", x={"a": [1, 2], "b": True})]
         self.assertTrue(score([call("f", x={"b": True, "a": [1, 2]})], ref, tools)["exact_match"])
         self.assertFalse(score([call("f", x={"a": [2, 1], "b": True})], ref, tools)["exact_match"])
 
     def test_invalid_output_counts_as_zero(self):
+        """Verify invalid output counts as zero."""
         result = score(None, EXPECTED, TOOLS)
         self.assertFalse(result["valid"])
         self.assertFalse(result["schema_compliant"])
         self.assertEqual((result["argument_correct"], result["argument_total"]), (0, 2))
 
     def test_zero_argument_and_empty_call_policies(self):
+        """Verify zero argument and empty call policies."""
         tools = [{"name": "ping", "parameters": {}}]
         result = score([call("ping")], [call("ping")], tools)
         self.assertTrue(result["exact_match"])
@@ -145,6 +164,7 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(result["argument_total"], 2)
 
     def test_micro_aggregation_and_combined_counts(self):
+        """Verify micro aggregation and combined counts."""
         scores = [score(EXPECTED, EXPECTED, TOOLS), score(None, [call(a=2)], TOOLS)]
         metrics = summarize(scores)
         self.assertEqual(metrics["valid_call_rate"], 0.5)
@@ -152,6 +172,7 @@ class MetricTests(unittest.TestCase):
         self.assertIsNone(summarize([])["valid_call_rate"])
 
     def test_hand_calculated_five_metric_table(self):
+        """Verify hand calculated five metric table."""
         predictions = [EXPECTED, [call(a=2, b=9)], [call(a=2)],
                        [call(a=2, b=3, extra=5)], [call("other", a=2, b=3)], None]
         metrics = summarize([score(p, EXPECTED, TOOLS) for p in predictions])
@@ -162,6 +183,7 @@ class MetricTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["complete_call_accuracy"], 1 / 6)
 
     def test_matching_against_brute_force(self):
+        """Check optimal call matching against exhaustive assignments."""
         rng = random.Random(42)
         for _ in range(50):
             refs = [call(**{k: rng.randrange(3) for k in ("a", "b") if rng.randrange(2)}) for _ in range(3)]
@@ -182,11 +204,13 @@ class MetricTests(unittest.TestCase):
 
 class SchemaTests(unittest.TestCase):
     def check_type(self, hint, value, expected):
+        """Assert whether a value satisfies a supplied parameter type."""
         tools = [{"name": "f", "parameters": {"x": {"type": hint, "required": True}}}]
         result = score([call("f", x=value)], [call("f", x=value)], tools)
         self.assertEqual(result["schema_compliant"], expected)
 
     def test_aliases_and_generics(self):
+        """Verify aliases and generics."""
         for hint, value, expected in (
             ("float", 3, True), ("float", "3", False),
             ("List[int]", [1, 2], True), ("List[int]", [1, True], False),
@@ -205,6 +229,7 @@ class SchemaTests(unittest.TestCase):
                 self.check_type(hint, value, expected)
 
     def test_json_schema_required_items_and_constraints(self):
+        """Verify JSON schema required items and constraints."""
         tools = [{"name": "f", "parameters": {
             "type": "object", "properties": {
                 "xs": {"type": "array", "items": {"type": "integer"}, "minItems": 1},
@@ -216,6 +241,7 @@ class SchemaTests(unittest.TestCase):
             self.assertFalse(score([call("f", **arguments)], [], tools)["schema_compliant"])
 
     def test_unknown_type_and_invalid_schemas_fail_early(self):
+        """Verify unknown type and invalid schemas fail early."""
         for parameters in (
             {"x": {"type": "ImaginaryType"}},
             {"x": {"type": "__import__('os').system('echo BAD')"}},
@@ -231,6 +257,7 @@ class SchemaTests(unittest.TestCase):
                 compile_tools([{"name": "f", "parameters": parameters}])
 
     def test_same_name_overloads(self):
+        """Verify same name overloads."""
         tools = [
             {"name": "f", "parameters": {"x": {"type": "int", "required": True}}},
             {"name": "f", "parameters": {"y": {"type": "str", "required": True}}},
@@ -242,6 +269,7 @@ class EvaluationIntegrationTests(unittest.TestCase):
     """Exercise CLI, serialization and aggregation with model/data test doubles."""
 
     def setUp(self):
+        """Prepare controlled model and dataset substitutes for evaluator integration checks."""
         self.model_loads = 0
         self.model_settings = []
         owner = self
@@ -249,32 +277,43 @@ class EvaluationIntegrationTests(unittest.TestCase):
                 for i in range(3)]
 
         class FakeDataset:
+            """Provide controlled split contents and batches for evaluator checks."""
+
             def __init__(self, examples):
+                """Initialize the local test double and its recorded state."""
                 self.examples = examples
 
             def __len__(self):
+                """Return the number of controlled examples."""
                 return len(self.examples)
 
             def __getitem__(self, index):
+                """Return one controlled example or slice."""
                 return self.examples[index]
 
             @classmethod
             def load_splits(cls):
+                """Return the controlled evaluation splits."""
                 return {"test_seen": cls(rows[:2]), "test_unseen": cls(rows[2:]),
                         "validation": cls(rows)}
 
             def make_loader(self, batch_size, shuffle, num_workers):
+                """Yield ordered example batches without starting loader workers."""
                 assert shuffle is False and num_workers == 0
                 return (self.examples[i:i + batch_size]
                         for i in range(0, len(self), batch_size))
 
         class FakeModel:
+            """Provide predetermined generated responses and record evaluator loading options."""
+
             def __init__(self, **kwargs):
+                """Initialize the local test double and its recorded state."""
                 owner.model_loads += 1
                 owner.model_settings.append(kwargs)
                 self.model = types.SimpleNamespace(dtype="torch.bfloat16", device="cpu")
 
             def generate_batch(self, queries, tools, max_new_tokens):
+                """Return predetermined responses that exercise evaluator scoring."""
                 outputs = {
                     "q0": json.dumps(EXPECTED),
                     "q1": "```json\n" + json.dumps(EXPECTED) + "\n```",
@@ -293,6 +332,7 @@ class EvaluationIntegrationTests(unittest.TestCase):
         self.modules = modules
 
     def run_cli(self, *arguments):
+        """Execute the evaluator with patched modules and capture its console output."""
         from eval.eval import main
         output = io.StringIO()
         with patch.dict(sys.modules, self.modules), patch.object(
@@ -302,6 +342,7 @@ class EvaluationIntegrationTests(unittest.TestCase):
         return output.getvalue()
 
     def test_both_splits_saved_and_combined_correctly(self):
+        """Verify both splits saved and combined correctly."""
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory, "predictions.jsonl")
             text = self.run_cli("--split", "both", "--batch-size", "8", "--output", str(output))
@@ -322,6 +363,7 @@ class EvaluationIntegrationTests(unittest.TestCase):
             self.assertEqual(report["settings"]["model"], "test-double")
 
     def test_hub_model_and_local_checkpoint_selection(self):
+        """Verify hub model and local checkpoint selection."""
         for model_name in ("example/another-pretrained-model", "checkpoints/full"):
             with self.subTest(model=model_name), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory, "predictions.jsonl")
@@ -332,17 +374,20 @@ class EvaluationIntegrationTests(unittest.TestCase):
                 self.assertEqual(report["combined"]["complete_call_accuracy"], 1.0)
 
     def test_limit_and_no_output(self):
+        """Verify limit and no output."""
         with tempfile.TemporaryDirectory() as directory:
-            # No-output and output are mutually exclusive; the default must not be used.
+
             with patch("eval.eval.open", side_effect=AssertionError("unexpected file write"), create=True):
                 text = self.run_cli("--split", "validation", "--limit", "1", "--no-output")
             self.assertIn("Examples: 1", text)
 
     def test_preflight_does_not_load_model(self):
+        """Verify preflight does not load model."""
         self.run_cli("--model", "example/another-pretrained-model", "--split", "both", "--check-data-only")
         self.assertEqual(self.model_loads, 0)
 
     def test_invalid_schema_stops_before_model_loading(self):
+        """Verify invalid schema stops before model loading."""
         bad = self.dataset_class([{"id": 9, "query": "q", "answers": EXPECTED,
                                   "tools": [{"name": "f", "parameters": {"x": {"type": "Unknown"}}}]}])
         with patch.object(self.dataset_class, "load_splits", return_value={"test_seen": bad}):

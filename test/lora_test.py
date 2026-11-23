@@ -1,4 +1,4 @@
-"""One shared protocol and actual adapter training without quantization or downloads."""
+"""Check shared method settings, LoRA training, and checkpoint recovery."""
 
 import json
 import shutil
@@ -14,6 +14,7 @@ from train.QLoRA import parse_args as qlora_args
 
 
 def test_three_final_recipes_share_monitoring_and_effective_batch():
+    """Verify three final recipes share monitoring and effective batch."""
     full, lora, qlora = full_args([]), parse_args([]), qlora_args([])
     assert [args.lr for args in (full, lora, qlora)] == [5e-6, 1e-4, 1e-4]
     for args in (full, lora, qlora):
@@ -29,6 +30,7 @@ def test_three_final_recipes_share_monitoring_and_effective_batch():
 
 
 def test_native_lora_trains_only_adapters_with_shared_checkpoint_selection(tmp_path, monkeypatch):
+    """Verify native LoRA trains only adapters with shared checkpoint selection."""
     pytest.importorskip("peft")
     from data.data import FunctionCallingDataset
     from train import validation
@@ -49,6 +51,7 @@ def test_native_lora_trains_only_adapters_with_shared_checkpoint_selection(tmp_p
         calls = []
 
         def generate(model, tokenizer, examples, args, device, dtype, output, step):
+            """Return controlled validation scores and record the selected examples."""
             calls.append((step, [row["id"] for row in examples]))
             return {"examples": len(examples), "complete_call_accuracy": 1.0 if step in (0, 2) else 0.0}
 
@@ -57,6 +60,7 @@ def test_native_lora_trains_only_adapters_with_shared_checkpoint_selection(tmp_p
         save = CheckpointManager.save
 
         def capture(manager, *values, **keywords):
+            """Copy the requested recovery checkpoint before retention removes it."""
             result = save(manager, *values, **keywords)
             point = manager.output_dir / "checkpoint-4"
             if point.is_dir() and not captured.exists():

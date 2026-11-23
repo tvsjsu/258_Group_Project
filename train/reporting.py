@@ -1,4 +1,5 @@
-"""Report schema, provenance, memory measurements, and artifact sizes."""
+"""Measure training resources and save reproducible metrics and histories."""
+
 import csv
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
@@ -13,11 +14,12 @@ import torch
 
 try:
     import resource
-except ImportError:  # Windows does not provide resource.
+except ImportError:
     resource = None
 
 
 def write_json(path, value):
+    """Save a UTF-8 JSON artifact while rejecting non-finite numeric values."""
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
@@ -101,6 +103,7 @@ class MemoryTracker:
     """Track training intervals; keep platform-specific measurement labels."""
 
     def __init__(self, device):
+        """Initialize resource peaks and begin the first training measurement interval."""
         self.device = device
         self.peak = 0
         self.reserved_peak = 0
@@ -113,6 +116,7 @@ class MemoryTracker:
         self.sample()
 
     def sample(self):
+        """Update memory peaks using the counters available on the active platform."""
         if self.device.type == "cuda":
             self.peak = max(self.peak, torch.cuda.max_memory_allocated(self.device))
             self.reserved_peak = max(self.reserved_peak, torch.cuda.max_memory_reserved(self.device))
@@ -123,12 +127,15 @@ class MemoryTracker:
             self.peak = max(self.peak, rss if sys.platform == "darwin" else rss * 1024)
 
     def peak_bytes(self):
+        """Return the tracked memory peak or None when unavailable."""
         return None if self.device.type == "cpu" and resource is None else self.peak
 
     def reserved_bytes(self):
+        """Return the tracked CUDA allocator reservation peak when applicable."""
         return self.reserved_peak if self.device.type == "cuda" else None
 
     def label(self):
+        """Describe the platform-specific meaning of the recorded memory peak."""
         return {
             "cuda": "Peak GPU memory allocated during training",
             "mps": "Sampled peak MPS driver memory during training",
@@ -137,6 +144,7 @@ class MemoryTracker:
 
 
 def source_hashes(method_source=None):
+    """Fingerprint shared source files and the selected method entry point."""
     root = Path(__file__).resolve().parents[1]
     names = ["data/data.py", "model/prompt.py", "model/model.py", "eval/metrics.py", "eval/eval.py",
              "train/trainer.py", "train/config.py", "train/preparation.py", "train/reporting.py",
@@ -158,6 +166,7 @@ def parameter_counts(model):
 def build_report(*, args, method, model, device, precision, weight_dtype, autocast_dtype,
                  environment, prepared, training_metrics, sizes, model_load_seconds,
                  checkpoint_save_seconds, preprocessing_seconds, run_wall_seconds, checkpoints):
+    """Assemble training metrics, data identities, settings, and resource measurements."""
     data_manifest = prepared.manifest
     data_settings = data_manifest["settings"]
     code_hashes = data_manifest["code_sha256"]
@@ -249,6 +258,7 @@ def adapter_report(model, args, report):
 
 
 def print_report(report, args):
+    """Print the completed run metrics and artifact locations."""
     method = report["method"]
     trainable_params = report["trainable_parameters"]
     output_dir = Path(args.output_dir)

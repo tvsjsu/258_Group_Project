@@ -1,3 +1,5 @@
+"""Evaluate full models and adapters with the shared function-calling protocol."""
+
 import argparse
 import json
 from contextlib import nullcontext
@@ -58,8 +60,8 @@ def prepare_splits(split, limit=None):
 
 
 def load_model(model_name=None, *, device=None, dtype="auto", adapter=None, load_in_4bit=False):
-    """Load the requested model and return it with its resolved name."""
-    # Model imports stay here so metric tests do not load PyTorch/model weights.
+    """Lazily load the requested model or adapter and return its resolved base-model name."""
+
     from model.model import MODEL_NAME, FunctionCallingModel
 
     if adapter is not None:
@@ -168,6 +170,7 @@ def save_report(report, output_path):
 
 
 def main(argv=None):
+    """Run schema preflight, generate predictions, and save aggregate evaluation metrics."""
     args = parse_args(argv)
     splits = prepare_splits(args.split, args.limit)
     if args.check_data_only:

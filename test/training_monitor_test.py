@@ -1,4 +1,4 @@
-"""Cadence, held-out validation, best selection, retention, and deterministic recovery."""
+"""Check validation cadence, fixed subsets, checkpoint selection, and recovery."""
 
 import copy
 import json
@@ -19,6 +19,7 @@ from train.validation import generation_metrics, is_better, release_validation_c
 
 @pytest.fixture(autouse=True)
 def one_thread():
+    """Temporarily limit CPU execution to one thread for local model checks."""
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
     yield
@@ -26,6 +27,7 @@ def one_thread():
 
 
 def test_epoch_cadence_rounds_to_optimizer_boundaries():
+    """Verify epoch cadence rounds to optimizer boundaries."""
     boundaries = list(range(0, 103, 8)) + [103]
     events = [end for start, end in zip(boundaries, boundaries[1:])
               if validation_due(start, end, 103, 10)]
@@ -38,6 +40,7 @@ def test_epoch_cadence_rounds_to_optimizer_boundaries():
 
 
 def test_subset_is_seeded_stable_and_does_not_change_training_rng():
+    """Verify subset is seeded stable and does not change training RNG."""
     rows = [{"id": i} for i in range(500)]
     random.seed(11)
     state = random.getstate()
@@ -46,7 +49,7 @@ def test_subset_is_seeded_stable_and_does_not_change_training_rng():
     assert [row["id"] for row in chosen] == sorted(row["id"] for row in chosen)
     assert random.getstate() == state
     random.seed(99)
-    assert select_generation_subset(rows) == chosen  # Independent of global/training seed.
+    assert select_generation_subset(rows) == chosen
     assert select_generation_subset(rows, seed=43) != chosen
     assert select_generation_subset(rows[:8]) == rows[:8]
     assert select_generation_subset(rows, limit=None) == rows
@@ -54,6 +57,7 @@ def test_subset_is_seeded_stable_and_does_not_change_training_rng():
 
 
 def test_reference_manifest_checks_generation_subset(tmp_path):
+    """Verify reference manifest checks generation subset."""
     manifest = {"raw_splits": {}, "used_splits": {}, "chat_template_sha256": "same",
                 "tokenizer_revision": None, "code_sha256": {},
                 "generation_validation": {"ids": [1, 2], "seed": 42, "sha256": "example"}}
@@ -69,6 +73,7 @@ def test_reference_manifest_checks_generation_subset(tmp_path):
 
 
 def test_subset_does_not_reduce_loss_validation_and_is_in_manifest(tmp_path, splits, model_loaders, monkeypatch):
+    """Verify subset does not reduce loss validation and is in manifest."""
     from train import validation
     rows = []
     for i in range(300):
@@ -80,10 +85,12 @@ def test_subset_does_not_reduce_loss_validation_and_is_in_manifest(tmp_path, spl
     evaluate = trainer.timed_validation
 
     def loss(model, loader, device, dtype):
+        """Record the validation population and calculate its teacher-forced loss."""
         loss_sizes.append(len(loader.dataset))
         return evaluate(model, loader, device, dtype)
 
     def generate(model, tokenizer, examples, args, device, dtype, output, step):
+        """Return controlled validation metrics and record the evaluated examples."""
         generation_ids.append([row["id"] for row in examples])
         return {"examples": len(examples), "complete_call_accuracy": 0.5}
 
@@ -101,6 +108,7 @@ def test_subset_does_not_reduce_loss_validation_and_is_in_manifest(tmp_path, spl
 
 
 def test_selection_ties_and_baseline_exclusion():
+    """Verify selection ties and baseline exclusion."""
     best = {"complete_call_accuracy": 0.8, "val_loss": 0.1, "step": 2}
     assert not is_better({**best, "step": 3}, best)
     assert is_better({**best, "val_loss": 0.09}, best)
@@ -109,10 +117,12 @@ def test_selection_ties_and_baseline_exclusion():
 
 
 def test_main_uses_filtered_validation_only(tmp_path, splits, model_loaders, monkeypatch):
+    """Verify main uses filtered validation only."""
     from train import validation
     calls = []
 
     def generate(model, tokenizer, examples, args, device, dtype, output, step):
+        """Return controlled validation metrics and record the evaluated examples."""
         calls.append((step, [row["id"] for row in examples]))
         return {"examples": len(examples), "valid_call_rate": 1.0, "function_accuracy": 1.0,
                 "argument_accuracy": 1.0, "schema_compliance": 1.0,
@@ -122,7 +132,7 @@ def test_main_uses_filtered_validation_only(tmp_path, splits, model_loaders, mon
     report = finetune.main(training_args(tmp_path) + ["--generation-checks-per-epoch", "2"], splits=splits)
     assert all(ids == ["validation-0", "validation-1"] for _, ids in calls)
     assert report["validation_protocol"]["examples"] == 2
-    assert report["best_checkpoint"]["step"] > 0  # A perfect initial baseline is not a trained checkpoint.
+    assert report["best_checkpoint"]["step"] > 0
     assert (tmp_path / "best" / "model.safetensors").is_file()
     assert (tmp_path / "validation_history.csv").is_file()
     assert report["early_stopping"] is False
@@ -131,6 +141,7 @@ def test_main_uses_filtered_validation_only(tmp_path, splits, model_loaders, mon
 
 @pytest.mark.parametrize("adapter", [False, True])
 def test_four_epochs_best_retention_and_resume(tmp_path, adapter):
+    """Verify four epochs best retention and resume."""
     peft = pytest.importorskip("peft") if adapter else None
     torch.manual_seed(71)
     base = LlamaForCausalLM(LlamaConfig(
@@ -146,6 +157,7 @@ def test_four_epochs_best_retention_and_resume(tmp_path, adapter):
     captured = tmp_path / "recovery-point"
 
     def run(folder, resume=None):
+        """Execute a small training job with optional checkpoint recovery."""
         folder.mkdir()
         args = config.parse_args([
             "--device", "cpu", "--precision", "fp32", "--epochs", "4",
@@ -168,6 +180,7 @@ def test_four_epochs_best_retention_and_resume(tmp_path, adapter):
         save = manager.save
 
         def capture(*values, **keywords):
+            """Copy the requested recovery checkpoint before retention removes it."""
             seconds = save(*values, **keywords)
             point = folder / "checkpoint-4"
             if point.is_dir() and not captured.exists():
@@ -180,6 +193,7 @@ def test_four_epochs_best_retention_and_resume(tmp_path, adapter):
         val_loader = DataLoader(features[:2], batch_size=2, collate_fn=make_collator(0))
 
         def generate(step):
+            """Return controlled validation metrics and record the evaluated examples."""
             return {"examples": 2, "valid_call_rate": 1.0, "function_accuracy": 1.0,
                     "argument_accuracy": 1.0, "schema_compliance": 1.0,
                     "complete_call_accuracy": 1.0 if step == 0 else (0.9 if step == 3 else 0.2)}
@@ -211,6 +225,7 @@ def test_four_epochs_best_retention_and_resume(tmp_path, adapter):
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_generation_reuses_weights_and_restores_training_state(tmp_path, monkeypatch, fail):
+    """Verify generation reuses weights and restores training state."""
     from model.model import FunctionCallingModel
     model = torch.nn.Linear(2, 2)
     model.train()
@@ -220,6 +235,7 @@ def test_generation_reuses_weights_and_restores_training_state(tmp_path, monkeyp
            "answers": [{"name": "echo", "arguments": {}}]}
 
     def generate(wrapper, queries, tools, max_new_tokens):
+        """Check validation state and return controlled output or an injected failure."""
         assert wrapper.model is model and not model.training and tokenizer.padding_side == "left"
         assert max_new_tokens == 512
         random.random()
@@ -245,6 +261,7 @@ def test_generation_reuses_weights_and_restores_training_state(tmp_path, monkeyp
 
 
 def test_generation_oom_keeps_batch_fixed_and_restores_state(tmp_path, monkeypatch):
+    """Verify generation oom keeps batch fixed and restores state."""
     from model.model import FunctionCallingModel
     model = torch.nn.Linear(2, 2)
     model.train()
@@ -256,6 +273,7 @@ def test_generation_oom_keeps_batch_fixed_and_restores_state(tmp_path, monkeypat
     calls = []
 
     def generate(wrapper, queries, tools, max_new_tokens):
+        """Return one valid batch and then simulate an out-of-memory failure."""
         calls.append(len(queries))
         random.random()
         torch.rand(3)
@@ -279,6 +297,7 @@ def test_generation_oom_keeps_batch_fixed_and_restores_state(tmp_path, monkeypat
 
 
 def test_cache_release_is_at_phase_boundary_and_device_scoped(monkeypatch):
+    """Verify cache release is at phase boundary and device scoped."""
     from contextlib import nullcontext
     from unittest.mock import Mock
     selected, cleared = Mock(return_value=nullcontext()), Mock()
@@ -293,12 +312,13 @@ def test_cache_release_is_at_phase_boundary_and_device_scoped(monkeypatch):
 
 
 def test_kbit_preparation_changes_embedding_precision():
+    """Verify FP32 preparation of unquantized modules without exercising CUDA quantization."""
     peft = pytest.importorskip("peft")
     model = LlamaForCausalLM(LlamaConfig(vocab_size=16, hidden_size=8, intermediate_size=16,
                                       num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2))
     model.to(torch.bfloat16)
     assert model.get_input_embeddings().weight.dtype == torch.bfloat16
-    # Check preparation semantics; no quantization or CUDA allocation is simulated here.
+
     peft.prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     assert model.get_input_embeddings().weight.dtype == torch.float32
     assert model.model.layers[0].input_layernorm.weight.dtype == torch.float32
@@ -329,6 +349,7 @@ def test_full_main_real_generation_export_and_resume(tmp_path, monkeypatch):
     save = CheckpointManager.save
 
     def capture(manager, *values, **keywords):
+        """Copy the requested recovery checkpoint before retention removes it."""
         result = save(manager, *values, **keywords)
         point = manager.output_dir / "checkpoint-4"
         if point.is_dir() and not captured.exists():

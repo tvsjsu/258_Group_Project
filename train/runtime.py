@@ -1,4 +1,5 @@
-"""Device selection, precision, and synchronization shared by all methods."""
+"""Resolve device and precision settings shared by model builders and training."""
+
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -7,6 +8,8 @@ import torch
 
 @dataclass(frozen=True)
 class ModelContext:
+    """Provide immutable device, precision, and revision settings to model builders."""
+
     device: torch.device
     weight_dtype: torch.dtype
     compute_dtype: torch.dtype
@@ -14,6 +17,7 @@ class ModelContext:
 
 
 def pick_device(requested):
+    """Resolve the requested device or select CUDA, MPS, then CPU."""
     if requested:
         return torch.device(requested)
     if torch.cuda.is_available():
@@ -38,12 +42,14 @@ def resolve_precision(precision, device):
 
 
 def autocast(device, dtype):
+    """Create an autocast context when mixed-precision computation is enabled."""
     if dtype is None:
         return nullcontext()
     return torch.autocast(device_type=device.type, dtype=dtype)
 
 
 def synchronize(device):
+    """Wait for queued accelerator operations before measuring elapsed time."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elif device.type == "mps":

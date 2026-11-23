@@ -1,3 +1,5 @@
+"""Build the shared one-shot function-calling prompts used in training and evaluation."""
+
 import json
 
 SYSTEM_PROMPT = """You select API calls from supplied function definitions.
@@ -41,12 +43,14 @@ User request:
 
 
 def format_prompt(query, tools):
+    """Format a user query and function definitions using the shared prompt template."""
     return PROMPT_TEMPLATE.format(
         query=query,
         tools=json.dumps(tools, ensure_ascii=False),
     )
 
 def build_messages(query, tools):
+    """Build the system instruction, fixed demonstration, and current user request."""
     example_tools = [
         {
             "name": "demo_set_temperature",

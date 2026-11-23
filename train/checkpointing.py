@@ -1,4 +1,4 @@
-"""Full-model or adapter checkpoints, best-model snapshots, and deterministic recovery."""
+"""Save and recover training state, selected models, and validation predictions."""
 
 import json
 import os
@@ -12,6 +12,7 @@ import torch
 
 
 def rng_state():
+    """Capture Python, CPU Torch, and available CUDA random-generator states."""
     return {
         "python": random.getstate(),
         "torch": torch.get_rng_state(),
@@ -20,6 +21,7 @@ def rng_state():
 
 
 def restore_rng(state):
+    """Restore the captured random-generator states without advancing them."""
     random.setstate(state["python"])
     torch.set_rng_state(state["torch"])
     if state["cuda"]:
@@ -27,7 +29,10 @@ def restore_rng(state):
 
 
 class CheckpointManager:
+    """Manage resumable state, retained checkpoints, and best-model snapshots."""
+
     def __init__(self, args):
+        """Initialize run paths and load an optional recovery checkpoint onto CPU."""
         self.args = args
         self.output_dir = Path(args.output_dir)
         self.resume = Path(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
@@ -38,6 +43,7 @@ class CheckpointManager:
             self.best = self.state.get("best")
 
     def prepare(self, manifest, args, tokenizer):
+        """Verify data and configuration identity before creating or resuming checkpoints."""
         self.tokenizer = tokenizer
         ignored = {"output_dir", "resume_from_checkpoint", "save_steps", "log_every", "reference_data"}
         self.contract = {
@@ -62,11 +68,13 @@ class CheckpointManager:
                 raise ValueError("Tokenizer differs from reference data_splits.json")
 
     def bind_model(self, model):
+        """Record the resolved base-model revision and verify it on resume."""
         self.base_revision = getattr(model.config, "_commit_hash", None)
         if self.state and self.base_revision != self.state["base_revision"]:
             raise ValueError("The resolved base model revision differs from the checkpoint")
 
     def record_environment(self, environment):
+        """Save hardware and software details for the current training session."""
         session_id = time.time_ns()
         path = self.output_dir / f"run_session-{session_id}.json"
         path.write_text(json.dumps({
@@ -76,11 +84,13 @@ class CheckpointManager:
         }, indent=2), encoding="utf-8")
 
     def sessions(self):
+        """Combine inherited and current session records without duplicates."""
         records = list(self.state.get("sessions", [])) if self.state else []
         records.extend(json.loads(path.read_text(encoding="utf-8")) for path in sorted(self.output_dir.glob("run_session-*.json")))
         return list({record["session_id"]: record for record in records}.values())
 
     def restore(self, optimizer, scheduler):
+        """Recover optimizer, scheduler, best-model snapshots, and recorded progress."""
         if self.state:
             predictions = self.resume / "validation_predictions"
             if predictions.is_dir():
@@ -100,20 +110,24 @@ class CheckpointManager:
         return {}
 
     def restore_random_state(self):
+        """Restore the checkpoint RNG after reconstructing the data-loader position."""
         if self.state:
             restore_rng(self.state["rng"])
 
     def should_save(self, step, epoch_end, final):
+        """Check the periodic, epoch-end, and final-step checkpoint conditions."""
         return step % self.args.save_steps == 0 or epoch_end or final
 
     @staticmethod
     def _link_or_copy(source, destination):
+        """Create a hard link when supported, otherwise copy the file."""
         try:
             os.link(source, destination)
         except OSError:
             shutil.copy2(source, destination)
 
     def _replace_directory(self, source, destination):
+        """Replace an artifact directory with a staged snapshot."""
         temporary = self.output_dir / ".best-recovery"
         shutil.rmtree(temporary, ignore_errors=True)
         shutil.copytree(source, temporary, copy_function=self._link_or_copy)
@@ -121,6 +135,7 @@ class CheckpointManager:
         temporary.rename(destination)
 
     def _write_best(self):
+        """Atomically save the selected checkpoint metadata and selection rule."""
         path = self.output_dir / "best_checkpoint.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps({**self.best, "model_path": "best",
@@ -129,6 +144,7 @@ class CheckpointManager:
         temporary.replace(path)
 
     def prune(self):
+        """Retain the latest two resumable checkpoints and the selected best checkpoint."""
         checkpoints = sorted((path for path in self.output_dir.glob("checkpoint-*")
                               if path.is_dir() and path.name.removeprefix("checkpoint-").isdigit()),
                              key=lambda path: int(path.name.removeprefix("checkpoint-")))
@@ -140,6 +156,7 @@ class CheckpointManager:
                 shutil.rmtree(path)
 
     def save(self, model, optimizer, scheduler, progress, best_candidate=None):
+        """Save a recoverable checkpoint, preserving RNG state and accounting for export and retention time."""
         started = time.perf_counter()
         destination = self.output_dir / f"checkpoint-{progress['step']}"
         if destination.exists():
@@ -189,7 +206,7 @@ class CheckpointManager:
             }, indent=2), encoding="utf-8")
             latest_temporary.replace(latest)
             self.prune()
-            # Recovery accounting includes export/retention work, not just serialization.
+
             info_path = destination / "checkpoint_info.json"
             info = json.loads(info_path.read_text(encoding="utf-8"))
             info["checkpoint_save_seconds"] = time.perf_counter() - started
@@ -201,11 +218,12 @@ class CheckpointManager:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
         finally:
-            # Serialization must not advance the training RNG stream.
+
             restore_rng(saved_rng)
 
     def storage_bytes(self):
-        # Logical file sizes; filesystem hard links can reduce actual occupied space.
+
+        """Return logical file bytes across retained checkpoints, including hard-linked snapshots."""
         return sum(path.stat().st_size for directory in self.output_dir.glob("checkpoint-*")
                    for path in directory.rglob("*") if path.is_file())
 

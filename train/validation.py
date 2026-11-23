@@ -1,4 +1,4 @@
-"""Validation cadence and generation scoring on the in-memory training model."""
+"""Measure validation loss and score generated function calls during training."""
 
 import gc
 import json
@@ -21,6 +21,7 @@ def release_validation_cache(device):
 
 
 def generation_oom_message(step, batch_size):
+    """Explain a generation memory failure and suggest an explicit smaller batch."""
     smaller = max(1, batch_size // 2)
     if batch_size == 1:
         advice = "Generation already uses batch size 1; inspect live GPU memory and other GPU processes."
@@ -143,6 +144,7 @@ def evaluate_loss(model, loader, device, autocast_dtype):
 
 
 def timed_validation(model, loader, device, autocast_dtype):
+    """Measure synchronized teacher-forced validation loss and elapsed time."""
     synchronize(device)
     started = time.perf_counter()
     loss = evaluate_loss(model, loader, device, autocast_dtype)

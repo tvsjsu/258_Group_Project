@@ -1,4 +1,5 @@
-"""Shared prompt encoding, filtering, data identity, and validation-subset selection."""
+"""Encode prompts, filter examples, build loaders, and identify shared data subsets."""
+
 from dataclasses import dataclass
 import hashlib
 import json
@@ -16,13 +17,7 @@ UNSEEN_FRACTION = 0.2
 
 
 def response_text(tokenizer, query, tools, answers):
-    """Return (prompt, target) strings.
-
-    The prompt is rendered exactly as at inference (generation prompt added).
-    The target is whatever the chat template places after it for an assistant
-    turn, so training matches the model's native format, and it always ends
-    with the EOS token that stops generation.
-    """
+    """Render the shared inference prompt and its EOS-terminated assistant target."""
     messages = build_messages(query, tools)
     prompt = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False
@@ -42,11 +37,12 @@ def response_text(tokenizer, query, tools, answers):
 
 
 def encode_example(tokenizer, example):
+    """Encode prompt and target once, masking prompt labels and avoiding duplicate special tokens."""
     prompt, target = response_text(
         tokenizer, example["query"], example["tools"], example["answers"]
     )
-    # Same call as FunctionCallingModel.generate_batch: the template already
-    # contains any BOS token, so do not add special tokens again.
+
+
     prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
     target_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
     return {
@@ -56,6 +52,7 @@ def encode_example(tokenizer, example):
 
 
 def update_fingerprint(digest, example):
+    """Add a canonically serialized example to a content fingerprint."""
     content = json.dumps(example, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     digest.update(content.encode("utf-8") + b"\n")
 
@@ -90,12 +87,6 @@ def prepare_split(tokenizer, examples, max_length):
     }
 
 
-def encode_split(tokenizer, examples, max_length):
-    """Keep the original (features, dropped_count) interface for other callers."""
-    features, details = prepare_split(tokenizer, examples, max_length)
-    return features, details["dropped_count"]
-
-
 def describe_splits(splits):
     """Fingerprint split contents and order, preserving original dataset IDs."""
     result = {}
@@ -110,7 +101,9 @@ def describe_splits(splits):
 
 
 def make_collator(pad_id):
+    """Create a right-padding collator that masks padded labels."""
     def collate(batch):
+        """Pad one training batch to its longest sequence and construct attention masks."""
         width = max(len(item["input_ids"]) for item in batch)
         input_ids, labels, attention = [], [], []
         for item in batch:
@@ -140,6 +133,8 @@ def select_generation_subset(examples, limit=256, seed=42):
 
 @dataclass
 class PreparedData:
+    """Collect encoded features, validation examples, tokenizer, and data identities."""
+
     tokenizer: Any
     train_examples: list
     val_examples: list
@@ -208,6 +203,7 @@ def prepare_data(args, *, splits=None, revision=None, code_hashes=None):
 
 
 def make_loaders(prepared, args):
+    """Build seeded training and ordered validation loaders with separate batch sizes."""
     collate = make_collator(prepared.tokenizer.pad_token_id)
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(prepared.train_features, batch_size=args.batch_size, shuffle=True,

@@ -1,4 +1,4 @@
-"""Opt-in real NF4 training smoke test; no model or dataset downloads required."""
+"""Verify NF4 adapter training and checkpoint reload on actual CUDA hardware."""
 
 import os
 import pytest
@@ -10,6 +10,7 @@ import torch
     reason="Set RUN_QLORA_CUDA_TEST=1 on a CUDA machine with the qlora extra installed",
 )
 def test_real_nf4_training_and_adapter_reload(tmp_path, monkeypatch):
+    """Verify real NF4 training and adapter reload."""
     pytest.importorskip("peft")
     pytest.importorskip("bitsandbytes")
     from tokenizers import Tokenizer, models, pre_tokenizers

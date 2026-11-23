@@ -1,4 +1,5 @@
-"""Shared experiment orchestration and optimizer loop for all training methods."""
+"""Coordinate training, validation, checkpointing, and reporting for all methods."""
+
 from itertools import islice
 import json
 import math
@@ -19,6 +20,7 @@ from train.validation import timed_validation
 
 
 def build_optimizer(name, model, lr, weight_decay):
+    """Create the requested optimizer with the configured learning rate and weight decay."""
     if name == "adafactor":
         from transformers.optimization import Adafactor
         return Adafactor(
@@ -355,6 +357,7 @@ def run_experiment(args, build_model, *, method, splits=None, describe_model=Non
     evaluator = None
     if args.generation_checks_per_epoch and prepared.generation_examples:
         def evaluator(step):
+            """Evaluate the fixed generation subset using the model already in memory."""
             return validation.generation_metrics(model, prepared.tokenizer, prepared.generation_examples, args,
                                                  device, autocast_dtype, output_dir, step)
     training_metrics = run_training(model, train_loader, val_loader, args, device, autocast_dtype,

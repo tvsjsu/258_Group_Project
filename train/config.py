@@ -1,9 +1,11 @@
-"""Shared command-line configuration with small per-method overrides."""
+"""Define shared training options and method-specific adapter settings."""
+
 import argparse
 import math
 
 
 def example_limit(value):
+    """Parse a nonnegative example count or an unrestricted all-examples limit."""
     if value == "all":
         return None
     try:
@@ -16,6 +18,7 @@ def example_limit(value):
 
 
 def parse_args(argv=None, configure_parser=None):
+    """Parse common training options and apply optional method-specific defaults."""
     from model.model import MODEL_NAME
     p = argparse.ArgumentParser(description="Full fine-tuning on the xLAM train split.")
     p.add_argument("--model", default=MODEL_NAME, help="Hugging Face id or local path.")
@@ -55,14 +58,6 @@ def parse_args(argv=None, configure_parser=None):
     p.add_argument("--no-save", action="store_true", help="Skip writing the model checkpoint.")
     p.add_argument("--seed", type=int, default=42)
 
-    # Sample command line for a quick sanity check (20 optimizer steps on 400 train examples, 50 validation examples):
-    # uv run python -m train.finetune \
-    #   --limit-train 400 \
-    #   --limit-val 50 \
-    #   --max-steps 20 \
-    #   --log-every 1 \
-    #   --output-dir checkpoints/full_sanity
-
     if configure_parser is not None:
         configure_parser(p)
     args = p.parse_args(argv)
@@ -91,6 +86,7 @@ def parse_args(argv=None, configure_parser=None):
 
 
 def add_adapter_arguments(parser):
+    """Register the rank, scaling, dropout, and target-layer options for adapters."""
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -98,6 +94,7 @@ def add_adapter_arguments(parser):
 
 
 def validate_adapter_args(args):
+    """Validate adapter settings and require checkpoint saving."""
     if args.rank < 1 or args.lora_alpha < 1:
         raise ValueError("--rank and --lora-alpha must be positive")
     if not 0 <= args.lora_dropout < 1:

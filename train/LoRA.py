@@ -1,23 +1,24 @@
-"""LoRA model construction and entry point for the shared trainer.
+"""Configure and build LoRA adapter training runs for the shared trainer."""
 
-    uv run --extra lora python -m train.LoRA --output-dir checkpoints/lora_final
-"""
 from train.config import add_adapter_arguments, parse_args as parse_config, validate_adapter_args
 from train.reporting import adapter_report
 from train.trainer import run_experiment
 
 
 def configure_parser(parser):
+    """Set LoRA defaults and register shared adapter options."""
     parser.description = "LoRA on the shared function-calling data and evaluation protocol."
     parser.set_defaults(output_dir="checkpoints/lora", lr=1e-4, batch_size=1, grad_accum=16)
     add_adapter_arguments(parser)
 
 
 def parse_args(argv=None):
+    """Parse and validate the LoRA training configuration."""
     return validate_adapter_args(parse_config(argv, configure_parser))
 
 
 def build_model(args, context):
+    """Load an unquantized base and create or restore trainable LoRA adapters."""
     device, compute_dtype = context.device, context.compute_dtype
     from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM
@@ -46,10 +47,12 @@ def build_model(args, context):
 
 
 def describe_model(model, args, report, context):
+    """Describe the adapter settings and saved artifacts for a LoRA run."""
     return {**adapter_report(model, args, report), "quantization": None}
 
 
 def main(argv=None):
+    """Launch LoRA training through the shared experiment runner."""
     args = parse_args(argv)
     return run_experiment(args, build_model, method="lora", describe_model=describe_model,
                           method_source=__file__)
