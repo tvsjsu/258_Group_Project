@@ -30,88 +30,124 @@ Paste your token when prompted. If asked to add it as a Git credential, choose *
 
 ## Run tests
 
-After setup and Hugging Face login, run all tests:
-
-```bash
+```cmd
 uv run pytest -v
 ```
 
-## Prepare the baseline data splits
+Optional CUDA smoke test (Windows CMD):
 
-Use these shared settings for all training methods: `seed=42`, `unseen_fraction=0.2`.
-
-```python
-from data.data import FunctionCallingDataset
-
-splits = FunctionCallingDataset.load_splits(seed=42, unseen_fraction=0.2)
-for name, dataset in splits.items():
-    print(f"{name}: {len(dataset)}")
+```cmd
+set RUN_QLORA_CUDA_TEST=1
+uv run pytest test/qlora_cuda_test.py -v -s -rs
+set RUN_QLORA_CUDA_TEST=
 ```
 
-Expected test sizes: `test_seen: 3333`, `test_unseen: 3937`. Evaluation recreate the splits automatically.
+## Shared data
 
-## Run full fine-tuning
+Training and evaluation recreate the same splits using `seed=42` and `unseen_fraction=0.2`. Expected test sizes: **3,333 seen-tool** and **3,937 unseen-tool** examples.
 
-```bash
-uv run python -m train.finetune --limit-val all --output-dir checkpoints/full
-```
+Check the evaluation data:
 
-The output folder contains the model/tokenizer and these report files:
-
-- `train_metrics.json`: training/validation loss, time, memory, parameter counts, model/checkpoint sizes, settings, and hardware/software details.
-- `training_history.jsonl`: loss, learning rate, gradient norm, and example/token counts for each optimizer step.
-- `data_splits.json`: ordered split IDs and fingerprints, plus retained/dropped training and validation IDs after length filtering.
-
-The command uses the full validation split; omit `--limit-val all` to use the default 100 examples. Run the saved checkpoint through the evaluator below to obtain the five function-calling metrics.
-
-## Run evaluation
-
-Check the evaluation data without loading the model:
-
-```bash
+```cmd
 uv run python -m eval.eval --split both --check-data-only
 ```
 
-Run the full baseline evaluation on a GPU:
+Each training run saves split IDs, filtering details, and generation-subset IDs in `data_splits.json`.
 
-```bash
-uv run python -m eval.eval \
-  --model deepseek-ai/deepseek-coder-1.3b-instruct \
-  --split both \
-  --batch-size 8 \
-  --dtype bfloat16 \
-  --device cuda \
-  --max-new-tokens 512 \
-  --output results/baseline_full_one_shot_rerun.jsonl
+## Train
+
+All methods use the shared `train/trainer.py`.
+
+| Method | Learning rate | Microbatch × accumulation |
+| --- | --- | --- |
+| Full fine-tuning | `5e-6` | 1 × 16 |
+| LoRA | `1e-4` | 1 × 16 |
+| QLoRA | `1e-4` | 2 × 8 |
+
+Shared defaults: **four epochs**, effective batch size 16, AdamW, cosine scheduling, 3% warmup, a 2,048-token cutoff, and gradient checkpointing. LoRA/QLoRA use rank 16, alpha 32, dropout 0.05, and all linear target layers.
+Full fine-tuning:
+
+```cmd
+uv run python -m train.finetune --output-dir checkpoints/full_final
 ```
 
-Outputs: `results/baseline_full_one_shot_rerun.jsonl` and `results/baseline_full_one_shot_rerun.metrics.json`.
+LoRA:
 
-Run the same evaluation on a fine-tuned full-model checkpoint:
-
-```bash
-uv run python -m eval.eval \
-  --model checkpoints/full \
-  --split both \
-  --batch-size 8 \
-  --dtype bfloat16 \
-  --device cuda \
-  --max-new-tokens 512 \
-  --output results/full_finetuned_predictions.jsonl
+```cmd
+uv run python -m train.LoRA --output-dir checkpoints/lora_final
 ```
 
-`--model` accepts a Hugging Face model ID or local full-model checkpoint directory, including its tokenizer files. It defaults to the original DeepSeek model when omitted. Metrics are saved alongside predictions with the suffix `.metrics.json`.
+QLoRA:
 
-### Evaluation metrics
+QLoRA training requires an NVIDIA CUDA GPU and uses NF4 with double quantization.
+```cmd
+uv run python -m train.QLoRA --output-dir checkpoints/qlora_final
+```
 
-The script reports these five metrics for each test split and the combined results:
+### Validation and outputs
 
-| Metric | What it measures |
+- **Validation loss:** the full retained validation split, approximately ten checks per epoch.
+- **Generated metrics:** the same seeded 256-example validation subset before training and once per epoch; generation batch 4, greedy decoding, and up to 512 new tokens.
+- **Best checkpoint:** highest subset complete-call accuracy, then lower full-validation loss, then the earlier checkpoint. All four epochs finish; there is no early stopping.
+
+Results include `train_metrics.json`, `training_history.jsonl`, `validation_history.jsonl` / `.csv`, and `data_splits.json`. These contain metrics, plot data, timing, memory, parameters, storage, and reproducibility details.
+
+**`best/` contains the selected model or adapter; root weights are the last model.** The latest two resumable checkpoints plus the best are retained.
+
+To resume training, use the checkpoint path recorded in your run’s `latest_checkpoint.json`:
+
+```cmd
+uv run python -m train.<METHOD> --output-dir <RUN_DIR> --resume-from-checkpoint <CHECKPOINT_PATH>
+```
+
+Replace the placeholders using your training method:
+
+| Method | `<METHOD>` |
 | --- | --- |
-| **Valid-call rate** | Fraction of outputs that parse as strict JSON arrays with the required `name` and `arguments` call structure. |
-| **Function accuracy** | Fraction of examples where the predicted function names and call counts match the reference. |
-| **Argument accuracy** | Fraction of argument slots with correct values after matching calls by function name; missing and extra arguments count against the score. |
-| **Schema compliance** | Fraction of examples where every generated call names an available function and satisfies its parameter schema. |
-| **Complete-call accuracy** | Fraction of examples where all function names and arguments match the reference, including call counts. |
+| Full fine-tuning | `finetune` |
+| LoRA | `LoRA` |
+| QLoRA | `QLoRA` |
 
-Call order is ignored when scoring. Argument accuracy is aggregated over argument slots; the other four metrics are aggregated over examples.
+Use your original output folder for `<RUN_DIR>` and the actual checkpoint directory for `<CHECKPOINT_PATH>`.
+
+Include any custom arguments from the original training command. Resume requires the same training settings, total training budget, and source files.
+
+## Evaluate
+
+These commands evaluate the **complete seen-tool and unseen-tool test sets** with the same BF16 inference settings. Predictions are saved as JSONL, with aggregate results in the matching `.metrics.json` file.
+
+Original baseline:
+
+```cmd
+uv run python -m eval.eval --model deepseek-ai/deepseek-coder-1.3b-instruct --split both --batch-size 8 --dtype bfloat16 --device cuda --max-new-tokens 512 --output results/baseline_full_one_shot_rerun.jsonl
+```
+
+Full fine-tuning:
+
+```cmd
+uv run python -m eval.eval --model checkpoints/full_final/best --split both --batch-size 8 --dtype bfloat16 --device cuda --max-new-tokens 512 --output results/full_finetuned_predictions.jsonl
+```
+
+LoRA:
+
+```cmd
+uv run python -m eval.eval --adapter checkpoints/lora_final/best --split both --batch-size 8 --dtype bfloat16 --device cuda --max-new-tokens 512 --output results/lora_predictions.jsonl
+```
+
+QLoRA:
+
+```cmd
+uv run python -m eval.eval --adapter checkpoints/qlora_final/best --split both --batch-size 8 --dtype bfloat16 --device cuda --max-new-tokens 512 --output results/qlora_predictions.jsonl
+```
+
+Final evaluation uses an unquantized BF16 base and BF16 adapters for all methods. QLoRA's training-time validation uses its NF4 training model.
+
+| Metric | Meaning |
+| --- | --- |
+| Valid-call rate | Output parses as a strict JSON array with the required call structure. |
+| Function accuracy | Function names and call counts match the reference. |
+| Argument accuracy | Correct argument slots after call matching; missing/extra arguments are penalized. |
+| Schema compliance | Calls name available functions and satisfy their parameter schemas. |
+| Complete-call accuracy | Every function and argument matches, including call counts. |
+
+Call order is ignored. Argument accuracy is aggregated over argument slots; the other metrics are aggregated over examples. Test scores are not used for checkpoint selection.
