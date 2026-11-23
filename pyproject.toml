@@ -13,6 +13,13 @@ dependencies = [
 [dependency-groups]
 dev = ["pytest>=8,<10"]
 
+[project.optional-dependencies]
+qlora = [
+    "peft>=0.17,<0.19",
+    "accelerate>=1.10,<2",
+    "bitsandbytes>=0.48,<0.50",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 
